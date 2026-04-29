@@ -20,10 +20,3 @@ The script expects an Excel file with columns matching these naming conventions:
 
 **Target Variable:**
 - `Surfactant_Administered` (0 = no surfactant, 1 = one dose, 2 = two doses)
-
-## Usage
-
-### 1. Install Dependencies
-
-```bash
-pip install pandas numpy matplotlib seaborn scipy openpyxl
