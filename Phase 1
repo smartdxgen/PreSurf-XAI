@@ -1,0 +1,1682 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import KBinsDiscretizer, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import calibration_curve
+from catboost import CatBoostClassifier
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, roc_auc_score, roc_curve, \
+    auc
+import warnings
+import os
+from datetime import datetime
+import joblib
+from pycaret.classification import *
+import sys
+import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib import rcParams
+from sklearn.metrics import precision_recall_curve, average_precision_score
+from imblearn.over_sampling import SMOTE  # اضافه کردن SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+rcParams['font.family'] = 'DejaVu Sans'
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', None)
+np.random.seed(42)
+
+import logging
+
+logging.getLogger('pycaret').setLevel(logging.ERROR)
+os.environ['PYCARET_CUSTOM_LOGGING_LEVEL'] = 'CRITICAL'
+
+NUMERICAL_COLS_FOR_DISCRETIZATION = [
+    'Gestational_Age_Weeks', 'Gestational_Age_Days', 'Maternal_Age',
+    'Gravida', 'Parity', 'Birth_Weight', 'Birth_Height',
+    'Head_Circumference', 'Apgar_1min', 'Apgar_5min',
+    'Umbilical_pH', 'Base_Excess', 'FiO2'
+]
+
+
+def discretize_selected_features(df, target_col, numerical_cols, n_bins=5, strategy='quantile'):
+    """
+    Discretize only selected numerical columns
+    """
+    print(" Performing data discretization (only on selected columns)...")
+
+    df_discretized = df.copy()
+
+    # Check which columns exist in the data
+    available_cols = [col for col in numerical_cols if col in df.columns]
+    print(f"   Number of columns available for discretization: {len(available_cols)} out of {len(numerical_cols)}")
+
+    if not available_cols:
+        print(" None of the specified columns found in the data")
+        return df_discretized, {}
+
+    discretization_info = {
+        'strategy': strategy,
+        'n_bins': n_bins,
+        'features_discretized': available_cols,
+        'bin_edges': {}
+    }
+
+    # Discretize each selected feature
+    for feature in available_cols:
+        try:
+            # Check if column is numeric
+            if not np.issubdtype(df[feature].dtype, np.number):
+                print(f" Column {feature} is not numeric, skipping")
+                continue
+
+            discretizer = KBinsDiscretizer(
+                n_bins=n_bins,
+                encode='ordinal',
+                strategy=strategy
+            )
+
+            feature_values = df[[feature]].values
+            discretized_values = discretizer.fit_transform(feature_values)
+
+            new_feature_name = f"{feature}_discretized"
+            df_discretized[new_feature_name] = discretized_values.astype(int)
+
+            # Remove original feature
+            df_discretized = df_discretized.drop(columns=[feature])
+
+            # Store bin edges info
+            bin_edges = discretizer.bin_edges_[0]
+            discretization_info['bin_edges'][feature] = {
+                'original_feature': feature,
+                'new_feature_name': new_feature_name,
+                'bin_edges': bin_edges.tolist(),
+                'bin_ranges': [f"{bin_edges[i]:.2f}-{bin_edges[i + 1]:.2f}"
+                               for i in range(len(bin_edges) - 1)],
+                'strategy': strategy,
+                'n_bins': n_bins
+            }
+
+            print(f"   ✓ {feature} discretized → {new_feature_name}")
+
+        except Exception as e:
+            print(f"  Error discretizing feature {feature}: {e}")
+
+    print(f" Discretization completed. {len(available_cols)} columns discretized")
+    print(f"   Data shape before discretization: {df.shape}")
+    print(f"   Data shape after discretization: {df_discretized.shape}")
+
+    return df_discretized, discretization_info
+
+
+def find_best_model_with_pycaret(X_train, y_train, target_name, experiment_name="pycaret_experiment"):
+    """
+    Find best model using PyCaret
+    """
+    print("\n" + "=" * 70)
+    print(" Starting modeling with PyCaret")
+    print("=" * 70)
+
+    # Combine X_train and y_train
+    train_data = X_train.copy()
+    train_data[target_name] = y_train
+
+    # Setup PyCaret
+    print(" Setting up PyCaret...")
+
+    try:
+        clf = setup(
+            data=train_data,
+            target=target_name,
+            train_size=0.8,
+            session_id=42,
+            verbose=False,
+            log_experiment=False,
+            experiment_name=experiment_name,
+            fold_strategy='stratifiedkfold',
+            fold=5,
+            use_gpu=False,
+            n_jobs=-1,
+            remove_multicollinearity=False,
+        )
+
+        # Compare models
+        print(" Comparing models...")
+        compare_result = compare_models(
+            fold=5,
+            n_select=1,
+            verbose=False,
+            sort='Accuracy',
+            exclude=['qda', 'lda']
+        )
+
+        # Display comparison results
+        print("\n PyCaret Model Comparison Results:")
+        results = pull()
+        print(results[['Model', 'Accuracy', 'AUC', 'Recall', 'Prec.', 'F1']].to_string(index=False))
+
+        # Display best model info
+        best_model = compare_result
+        model_name = type(best_model).__name__
+        print(f"\n Best model selected: {model_name}")
+
+        # Create final model
+        print(" Training final model...")
+        final_model = finalize_model(best_model)
+
+        return final_model, model_name
+
+    except Exception as e:
+        print(f" Error in PyCaret: {e}")
+        print(" Using default CatBoostClassifier")
+        return CatBoostClassifier(random_state=42, verbose=False), "CatBoostClassifier"
+
+
+def optimize_catboost_with_sklearn_advanced(X_train, y_train, pycaret_accuracy):
+    """
+    Advanced CatBoost optimization with Scikit-learn
+    """
+    print("\n" + "=" * 70)
+    print(" Advanced CatBoostClassifier Optimization with Scikit-learn")
+    print(f" Target: Reaching PyCaret accuracy ({pycaret_accuracy:.4f} or better)")
+    print("=" * 70)
+
+    # Phase 1 parameters (fast)
+    param_grid_phase1 = {
+        'iterations': [200, 300],
+        'depth': [6, 8],
+        'learning_rate': [0.01, 0.05],
+        'l2_leaf_reg': [3, 5],
+        'random_strength': [1],
+    }
+
+    # Use Stratified K-Fold for Cross-Validation
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    print(" Phase 1: Initial fast search...")
+
+    # Grid Search phase 1
+    grid_search_phase1 = GridSearchCV(
+        estimator=CatBoostClassifier(
+            random_state=42,
+            verbose=False,
+            thread_count=-1,
+            allow_writing_files=False,
+            early_stopping_rounds=20
+        ),
+        param_grid=param_grid_phase1,
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=1,
+        error_score='raise'
+    )
+
+    print(" Running phase 1 search...")
+    grid_search_phase1.fit(X_train, y_train)
+
+    best_model_phase1 = grid_search_phase1.best_estimator_
+    best_params_phase1 = grid_search_phase1.best_params_
+    best_score_phase1 = grid_search_phase1.best_score_
+
+    print(f"\n Phase 1 Results:")
+    print(f"   Best accuracy: {best_score_phase1:.4f}")
+    print(f"   Best parameters:")
+    for param, value in best_params_phase1.items():
+        print(f"     {param}: {value}")
+
+    # If phase 1 accuracy is close to PyCaret, keep it
+    if best_score_phase1 >= pycaret_accuracy - 0.01:
+        print(f" Phase 1 accuracy ({best_score_phase1:.4f}) is close to PyCaret ({pycaret_accuracy:.4f})")
+        return best_model_phase1, best_params_phase1
+
+    print(f"\n🔍 Phase 2: Refined search to reach PyCaret accuracy...")
+
+    # Refine parameters based on phase 1 results
+    refined_param_grid = {
+        'iterations': [max(100, best_params_phase1.get('iterations', 200) - 50),
+                       best_params_phase1.get('iterations', 200),
+                       min(500, best_params_phase1.get('iterations', 200) + 50)],
+        'depth': [max(4, best_params_phase1.get('depth', 6) - 1),
+                  best_params_phase1.get('depth', 6),
+                  min(10, best_params_phase1.get('depth', 6) + 1)],
+        'learning_rate': [max(0.001, best_params_phase1.get('learning_rate', 0.05) * 0.5),
+                          best_params_phase1.get('learning_rate', 0.05),
+                          min(0.1, best_params_phase1.get('learning_rate', 0.05) * 1.5)],
+        'l2_leaf_reg': [max(1, best_params_phase1.get('l2_leaf_reg', 3) - 1),
+                        best_params_phase1.get('l2_leaf_reg', 3),
+                        min(10, best_params_phase1.get('l2_leaf_reg', 3) + 1)],
+        'random_strength': [0.8, 1.0, 1.2],
+        'bagging_temperature': [0.5, 1.0],
+        'border_count': [64],
+        'grow_policy': ['SymmetricTree'],
+        'min_data_in_leaf': [1, 3],
+        'max_leaves': [63]
+    }
+
+    # Grid Search phase 2
+    grid_search_phase2 = GridSearchCV(
+        estimator=CatBoostClassifier(
+            random_state=42,
+            verbose=False,
+            thread_count=-1,
+            allow_writing_files=False,
+            early_stopping_rounds=20,
+            od_type='Iter',
+            od_wait=20
+        ),
+        param_grid=refined_param_grid,
+        cv=cv,
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=2,
+        error_score='raise'
+    )
+
+    print(" Running phase 2 search...")
+    grid_search_phase2.fit(X_train, y_train)
+
+    best_model_phase2 = grid_search_phase2.best_estimator_
+    best_params_phase2 = grid_search_phase2.best_params_
+    best_score_phase2 = grid_search_phase2.best_score_
+
+    print(f"\n Phase 2 Results:")
+    print(f"   Best accuracy: {best_score_phase2:.4f}")
+    print(f"   PyCaret accuracy: {pycaret_accuracy:.4f}")
+    print(f"   Difference: {best_score_phase2 - pycaret_accuracy:+.4f}")
+    print(f"   Best parameters:")
+    for param, value in best_params_phase2.items():
+        print(f"     {param}: {value}")
+
+    # Compare with PyCaret accuracy
+    if best_score_phase2 >= pycaret_accuracy:
+        print(
+            f" Success! Scikit-learn accuracy ({best_score_phase2:.4f}) is better than PyCaret ({pycaret_accuracy:.4f})!")
+        selected_model = best_model_phase2
+        selected_params = best_params_phase2
+    elif best_score_phase2 >= pycaret_accuracy - 0.02:
+        print(f" Scikit-learn accuracy ({best_score_phase2:.4f}) is close to PyCaret ({pycaret_accuracy:.4f})")
+        selected_model = best_model_phase2
+        selected_params = best_params_phase2
+    else:
+        print(f"Scikit-learn accuracy ({best_score_phase2:.4f}) is lower than PyCaret ({pycaret_accuracy:.4f})")
+        print("   Using PyCaret-inspired parameters...")
+
+        # Use PyCaret default-like parameters
+        selected_params = {
+            'iterations': 300,
+            'depth': 6,
+            'learning_rate': 0.05,
+            'l2_leaf_reg': 3,
+            'random_strength': 1,
+            'border_count': 64,
+            'grow_policy': 'SymmetricTree',
+            'min_data_in_leaf': 1,
+            'max_leaves': 63
+        }
+
+        selected_model = CatBoostClassifier(
+            **selected_params,
+            random_state=42,
+            verbose=False,
+            thread_count=-1,
+            allow_writing_files=False
+        )
+        selected_model.fit(X_train, y_train)
+
+    # Final training with best parameters
+    print("\n Training final model with best parameters...")
+    final_model = CatBoostClassifier(
+        **selected_params,
+        random_state=42,
+        verbose=False,
+        thread_count=-1,
+        allow_writing_files=False,
+        early_stopping_rounds=20
+    )
+    final_model.fit(X_train, y_train)
+
+    # Final evaluation
+    cv_final = cross_val_score(final_model, X_train, y_train, cv=5, scoring='accuracy')
+    mean_final_score = np.mean(cv_final)
+    std_final_score = np.std(cv_final)
+
+    print(f"\n Final Evaluation:")
+    print(f"   Final CV accuracy: {mean_final_score:.4f} ± {std_final_score:.4f}")
+    print(f"   PyCaret accuracy: {pycaret_accuracy:.4f}")
+    print(f"   Difference: {mean_final_score - pycaret_accuracy:+.4f}")
+
+    return final_model, selected_params
+
+
+def optimize_randomforest_with_sklearn_advanced(X_train, y_train, pycaret_accuracy, apply_smote=False):
+    """
+    Advanced RandomForest optimization with Scikit-learn
+    """
+    print("\n" + "=" * 70)
+    print("🌳 Advanced RandomForestClassifier Optimization with Scikit-learn")
+    if apply_smote:
+        print("✨ با اعمال SMOTE (صحیح) - فقط روی داده‌های آموزش در هر fold")
+    print(f" Target: Reaching PyCaret accuracy ({pycaret_accuracy:.4f} or better)")
+    print("=" * 70)
+
+    # نمایش توزیع کلاس‌ها قبل از هر کاری
+    print("\n Class distribution (ORIGINAL):")
+    unique, counts = np.unique(y_train, return_counts=True)
+    total = len(y_train)
+    for cls, count in zip(unique, counts):
+        percentage = count / total * 100
+        print(f"   Class {cls}: {count} samples ({percentage:.1f}%)")
+
+    # Phase 1 parameters
+    param_grid_phase1 = {
+        'n_estimators': [100, 200],
+        'max_depth': [10, 20, None],
+        'min_samples_split': [2, 5],
+        'min_samples_leaf': [1, 2],
+        'max_features': ['sqrt', 'log2'],
+        'bootstrap': [True],
+        'criterion': ['gini', 'entropy']
+    }
+
+    # Use Stratified K-Fold for Cross-Validation
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    print("\n Phase 1: Initial search...")
+
+    if apply_smote:
+        # ایجاد Pipeline با SMOTE برای CV صحیح
+        pipeline = ImbPipeline([
+            ('smote', SMOTE(random_state=42)),
+            ('rf', RandomForestClassifier(random_state=42, n_jobs=-1))
+        ])
+
+        # تنظیم پارامتر گرید برای pipeline
+        param_grid_pipeline = {
+            'rf__' + key: value for key, value in param_grid_phase1.items()
+        }
+
+        # Grid Search phase 1 با pipeline (SMOTE در هر fold به صورت جداگانه)
+        grid_search_phase1 = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid_pipeline,
+            cv=cv,  # استفاده از cv اصلی
+            scoring='accuracy',
+            n_jobs=-1,
+            verbose=1,
+            error_score='raise'
+        )
+    else:
+        # Grid Search phase 1 بدون SMOTE
+        grid_search_phase1 = GridSearchCV(
+            estimator=RandomForestClassifier(random_state=42, n_jobs=-1),
+            param_grid=param_grid_phase1,
+            cv=cv,
+            scoring='accuracy',
+            n_jobs=-1,
+            verbose=1,
+            error_score='raise'
+        )
+
+    print(" Running phase 1 search...")
+    grid_search_phase1.fit(X_train, y_train)
+
+    best_model_phase1 = grid_search_phase1.best_estimator_
+    best_params_phase1 = grid_search_phase1.best_params_
+    best_score_phase1 = grid_search_phase1.best_score_
+
+    print(f"\n Phase 1 Results:")
+    print(f"   Best CV accuracy: {best_score_phase1:.4f}")
+    print(f"   PyCaret accuracy: {pycaret_accuracy:.4f}")
+    print(f"   Difference: {best_score_phase1 - pycaret_accuracy:+.4f}")
+
+    # نمایش تعداد نمونه‌ها در هر کلاس بعد از SMOTE (در صورت اعمال)
+    if apply_smote and hasattr(best_model_phase1, 'named_steps'):
+        try:
+            # آموزش مدل روی تمام داده‌ها برای نمایش توزیع
+            best_model_phase1.fit(X_train, y_train)
+            print("\n For information: After applying SMOTE to full training data:")
+            # تخمین تعداد نمونه‌های تولید شده توسط SMOTE
+            smote = SMOTE(random_state=42)
+            X_res, y_res = smote.fit_resample(X_train, y_train)
+            unique_res, counts_res = np.unique(y_res, return_counts=True)
+            for cls, count in zip(unique_res, counts_res):
+                percentage = count / len(y_res) * 100
+                print(f"   Class {cls}: {count} samples ({percentage:.1f}%)")
+        except:
+            pass
+
+    print(f"   Best parameters:")
+    for param, value in best_params_phase1.items():
+        print(f"     {param}: {value}")
+
+    # If phase 1 accuracy is close to PyCaret
+    if best_score_phase1 >= pycaret_accuracy - 0.02:
+        print(f" Phase 1 CV accuracy ({best_score_phase1:.4f}) is close to PyCaret ({pycaret_accuracy:.4f})")
+
+        # آموزش نهایی مدل با بهترین پارامترها
+        if apply_smote:
+            # استخراج پارامترهای RF از pipeline
+            rf_params = {}
+            for key, value in best_params_phase1.items():
+                if key.startswith('rf__'):
+                    rf_params[key[4:]] = value
+
+            # ایجاد pipeline نهایی با SMOTE
+            final_pipeline = ImbPipeline([
+                ('smote', SMOTE(random_state=42)),
+                ('rf', RandomForestClassifier(**rf_params, random_state=42, n_jobs=-1))
+            ])
+            final_pipeline.fit(X_train, y_train)
+            return final_pipeline, best_params_phase1
+        else:
+            final_model = RandomForestClassifier(**best_params_phase1, random_state=42, n_jobs=-1)
+            final_model.fit(X_train, y_train)
+            return final_model, best_params_phase1
+
+    print(f"\n Phase 2: Refined search...")
+
+    # Refine parameters based on phase 1 results
+    if apply_smote:
+        # استخراج پارامترهای اصلی
+        refined_best_params = {}
+        for key, value in best_params_phase1.items():
+            if key.startswith('rf__'):
+                refined_best_params[key[4:]] = value
+    else:
+        refined_best_params = best_params_phase1
+
+    refined_param_grid = {
+        'n_estimators': [max(50, refined_best_params.get('n_estimators', 100)),
+                         refined_best_params.get('n_estimators', 100),
+                         min(400, refined_best_params.get('n_estimators', 100) * 2)],
+        'max_depth': [
+            max(5, refined_best_params.get('max_depth', 10)) if refined_best_params.get('max_depth') else 5,
+            refined_best_params.get('max_depth', 10),
+            min(30, refined_best_params.get('max_depth', 20) + 10) if refined_best_params.get('max_depth') else 15,
+            None],
+        'min_samples_split': [max(2, refined_best_params.get('min_samples_split', 2)),
+                              refined_best_params.get('min_samples_split', 2),
+                              min(20, refined_best_params.get('min_samples_split', 2) * 3)],
+        'min_samples_leaf': [max(1, refined_best_params.get('min_samples_leaf', 1)),
+                             refined_best_params.get('min_samples_leaf', 1),
+                             min(10, refined_best_params.get('min_samples_leaf', 1) * 3)],
+        'max_features': [refined_best_params.get('max_features', 'sqrt'),
+                         'log2', None, 0.3, 0.5],
+        'criterion': [refined_best_params.get('criterion', 'gini')]
+    }
+
+    if apply_smote:
+        # ایجاد pipeline جدید برای فاز 2
+        pipeline_phase2 = ImbPipeline([
+            ('smote', SMOTE(random_state=42)),
+            ('rf', RandomForestClassifier(random_state=42, n_jobs=-1))
+        ])
+
+        # تنظیم پارامتر گرید برای pipeline
+        param_grid_pipeline_phase2 = {
+            'rf__' + key: value for key, value in refined_param_grid.items()
+        }
+
+        # Grid Search phase 2 با pipeline
+        grid_search_phase2 = GridSearchCV(
+            estimator=pipeline_phase2,
+            param_grid=param_grid_pipeline_phase2,
+            cv=cv,
+            scoring='accuracy',
+            n_jobs=-1,
+            verbose=2,
+            error_score='raise'
+        )
+    else:
+        # Grid Search phase 2 بدون SMOTE
+        grid_search_phase2 = GridSearchCV(
+            estimator=RandomForestClassifier(random_state=42, n_jobs=-1),
+            param_grid=refined_param_grid,
+            cv=cv,
+            scoring='accuracy',
+            n_jobs=-1,
+            verbose=2,
+            error_score='raise'
+        )
+
+    print(" Running phase 2 search...")
+    grid_search_phase2.fit(X_train, y_train)
+
+    best_model_phase2 = grid_search_phase2.best_estimator_
+    best_params_phase2 = grid_search_phase2.best_params_
+    best_score_phase2 = grid_search_phase2.best_score_
+
+    print(f"\n Phase 2 Results:")
+    print(f"   Best CV accuracy: {best_score_phase2:.4f}")
+    print(f"   PyCaret accuracy: {pycaret_accuracy:.4f}")
+    print(f"   Difference: {best_score_phase2 - pycaret_accuracy:+.4f}")
+
+    # انتخاب مدل نهایی
+    if best_score_phase2 >= pycaret_accuracy - 0.02:
+        print(f" Using Phase 2 model (close to PyCaret accuracy)")
+        selected_model = best_model_phase2
+        selected_params = best_params_phase2
+    else:
+        print(f"️ Using Phase 1 model (better than Phase 2)")
+        selected_model = best_model_phase1
+        selected_params = best_params_phase1
+
+    # آموزش نهایی مدل
+    print("\n Training final model with selected parameters...")
+    selected_model.fit(X_train, y_train)
+
+    # ارزیابی نهایی با CV (منصفانه)
+    if apply_smote:
+        # برای مدل‌های با SMOTE، از pipeline برای CV استفاده کن
+        cv_pipeline = ImbPipeline([
+            ('smote', SMOTE(random_state=42)),
+            ('rf', RandomForestClassifier(random_state=42, n_jobs=-1))
+        ])
+        cv_scores = cross_val_score(cv_pipeline, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
+    else:
+        cv_scores = cross_val_score(selected_model, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
+
+    mean_cv_score = np.mean(cv_scores)
+    std_cv_score = np.std(cv_scores)
+
+    print(f"\n Final CV Evaluation:")
+    print(f"   CV accuracy: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
+    print(f"   PyCaret accuracy: {pycaret_accuracy:.4f}")
+    print(f"   Difference: {mean_cv_score - pycaret_accuracy:+.4f}")
+
+    return selected_model, selected_params
+
+
+def perform_feature_importance_analysis(model, X_train, X_test, feature_names, output_dir, stage_name):
+    """
+    Feature importance analysis
+    """
+    print(f"\n" + "=" * 70)
+    print(f" Feature Importance Analysis - Stage {stage_name}")
+    print("=" * 70)
+
+    try:
+        # Extract model if it's a Pipeline
+        if hasattr(model, 'steps'):
+            for step_name, step_model in model.steps:
+                if isinstance(step_model, (CatBoostClassifier, RandomForestClassifier)):
+                    rf_model = step_model
+                    break
+            else:
+                rf_model = model
+        else:
+            rf_model = model
+
+        # Calculate feature importance
+        feature_importance = rf_model.feature_importances_
+
+        # Create DataFrame
+        importance_df = pd.DataFrame({
+            'feature': feature_names,
+            'importance': feature_importance
+        }).sort_values('importance', ascending=False)
+
+        # Save feature importance
+        importance_path = f'{output_dir}/feature_importance_stage_{stage_name}.xlsx'
+        importance_df.to_excel(importance_path, index=False)
+        print(f" Feature importance saved: {importance_path}")
+
+        # Display top 20 features
+        print(f"\n Top 20 Features (Stage {stage_name}):")
+        print("-" * 60)
+        top_features = importance_df.head(20)
+        for idx, row in top_features.iterrows():
+            print(f"  {idx + 1:2d}. {row['feature']:30s} : {row['importance']:.6f}")
+
+        return importance_df
+
+    except Exception as e:
+        print(f" Error in feature importance analysis: {e}")
+        return pd.DataFrame()
+
+
+def find_misclassified_sample(model, X_test, y_test):
+    """
+    Find a misclassified sample
+    """
+    y_pred = model.predict(X_test)
+
+    # Ensure y_test and y_pred are comparable
+    if hasattr(y_test, 'values'):
+        y_test_values = y_test.values
+    else:
+        y_test_values = y_test
+
+    misclassified_indices = np.where(y_pred != y_test_values)[0]
+
+    if len(misclassified_indices) > 0:
+        # Select first misclassified sample
+        idx = misclassified_indices[0]
+        return idx, X_test.iloc[idx], y_test_values[idx], y_pred[idx]
+    return None, None, None, None
+
+
+def plot_confusion_matrix_auc_curves(model, X_train, y_train, X_test, y_test, model_name, output_dir, stage_name):
+    """
+    Plot confusion matrix, AUC curves, and calibration curve
+    """
+    print(f"\n Plotting Confusion Matrix, AUC Curves, and Calibration Curve - Stage {stage_name}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # 1. Confusion Matrix
+    y_pred = model.predict(X_test)
+    cm = confusion_matrix(y_test, y_pred)
+
+    # Normalize confusion matrix
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+    sns.heatmap(cm_normalized, annot=cm, fmt='d', cmap='Blues',
+                xticklabels=np.unique(y_test),
+                yticklabels=np.unique(y_test),
+                ax=axes[0, 0])
+    axes[0, 0].set_xlabel('Predicted')
+    axes[0, 0].set_ylabel('Actual')
+    axes[0, 0].set_title(f'Confusion Matrix - Stage {stage_name}')
+
+    # 2. ROC Curve (modified for multi-class or non-binary labels)
+    if hasattr(model, 'predict_proba'):
+        y_proba = model.predict_proba(X_test)
+        unique_classes = np.unique(y_test)
+
+        if len(unique_classes) == 2:
+            # Binary classification - handle case where classes might not be 0 and 1
+            # Map classes to 0 and 1 for ROC calculation
+            le = LabelEncoder()
+            y_test_binary = le.fit_transform(y_test)
+
+            # Get index of positive class (class 1 after encoding)
+            pos_class_idx = np.where(le.classes_ == unique_classes[1])[0][0] if len(unique_classes) > 1 else 0
+
+            fpr, tpr, _ = roc_curve(y_test_binary, y_proba[:, pos_class_idx])
+            roc_auc = auc(fpr, tpr)
+
+            axes[0, 1].plot(fpr, tpr, color='darkorange', lw=2,
+                            label=f'ROC curve (AUC = {roc_auc:.2f})')
+            axes[0, 1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            axes[0, 1].set_xlim([0.0, 1.0])
+            axes[0, 1].set_ylim([0.0, 1.05])
+            axes[0, 1].set_xlabel('False Positive Rate')
+            axes[0, 1].set_ylabel('True Positive Rate')
+            axes[0, 1].set_title(f'ROC Curve - Stage {stage_name}')
+            axes[0, 1].legend(loc="lower right")
+            axes[0, 1].grid(True, alpha=0.3)
+
+        else:
+            # Multi-class classification
+            n_classes = len(unique_classes)
+            colors = plt.cm.rainbow(np.linspace(0, 1, n_classes))
+
+            for i, cls in enumerate(unique_classes):
+                # Create binary labels for this class
+                y_test_binary = (y_test == cls).astype(int)
+                # Get probability for this class
+                cls_idx = np.where(unique_classes == cls)[0][0]
+                fpr, tpr, _ = roc_curve(y_test_binary, y_proba[:, cls_idx])
+                roc_auc = auc(fpr, tpr)
+                axes[0, 1].plot(fpr, tpr, color=colors[i], lw=2,
+                                label=f'Class {cls} (AUC = {roc_auc:.2f})')
+
+            axes[0, 1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            axes[0, 1].set_xlim([0.0, 1.0])
+            axes[0, 1].set_ylim([0.0, 1.05])
+            axes[0, 1].set_xlabel('False Positive Rate')
+            axes[0, 1].set_ylabel('True Positive Rate')
+            axes[0, 1].set_title(f'ROC Curve - Stage {stage_name}')
+            axes[0, 1].legend(loc="lower right")
+            axes[0, 1].grid(True, alpha=0.3)
+
+    # 3. Calibration Curve (only for binary classification)
+    if hasattr(model, 'predict_proba'):
+        unique_classes = np.unique(y_test)
+        if len(unique_classes) == 2:
+            # Map classes to 0 and 1 for calibration
+            le = LabelEncoder()
+            y_test_binary = le.fit_transform(y_test)
+            pos_class_idx = np.where(le.classes_ == unique_classes[1])[0][0] if len(unique_classes) > 1 else 0
+
+            prob_true, prob_pred = calibration_curve(y_test_binary, y_proba[:, pos_class_idx], n_bins=10)
+
+            axes[1, 0].plot(prob_pred, prob_true, marker='o', linewidth=1, label='Model')
+            axes[1, 0].plot([0, 1], [0, 1], linestyle='--', label='Perfectly calibrated')
+            axes[1, 0].set_xlabel('Mean predicted probability')
+            axes[1, 0].set_ylabel('Fraction of positives')
+            axes[1, 0].set_title(f'Calibration Curve - Stage {stage_name}')
+            axes[1, 0].legend(loc='best')
+            axes[1, 0].grid(True, alpha=0.3)
+
+            # Add histogram
+            ax_hist = axes[1, 0].twinx()
+            ax_hist.hist(y_proba[:, pos_class_idx], bins=20, alpha=0.3, color='gray', edgecolor='black')
+            ax_hist.set_ylabel('Count')
+
+    # 4. Precision-Recall Curve (only for binary classification)
+    if hasattr(model, 'predict_proba'):
+        unique_classes = np.unique(y_test)
+        if len(unique_classes) == 2:
+            # Map classes to 0 and 1
+            le = LabelEncoder()
+            y_test_binary = le.fit_transform(y_test)
+            pos_class_idx = np.where(le.classes_ == unique_classes[1])[0][0] if len(unique_classes) > 1 else 0
+
+            precision, recall, _ = precision_recall_curve(y_test_binary, y_proba[:, pos_class_idx])
+            average_precision = average_precision_score(y_test_binary, y_proba[:, pos_class_idx])
+
+            axes[1, 1].plot(recall, precision, color='darkorange', lw=2,
+                            label=f'PR curve (AP = {average_precision:.2f})')
+            axes[1, 1].set_xlim([0.0, 1.0])
+            axes[1, 1].set_ylim([0.0, 1.05])
+            axes[1, 1].set_xlabel('Recall')
+            axes[1, 1].set_ylabel('Precision')
+            axes[1, 1].set_title(f'Precision-Recall Curve - Stage {stage_name}')
+            axes[1, 1].legend(loc="lower left")
+            axes[1, 1].grid(True, alpha=0.3)
+        else:
+            # For multi-class, show empty plot with message
+            axes[1, 1].text(0.5, 0.5, 'PR Curve available\nonly for binary\nclassification',
+                            ha='center', va='center', fontsize=12)
+            axes[1, 1].set_xlabel('Recall')
+            axes[1, 1].set_ylabel('Precision')
+            axes[1, 1].set_title(f'Precision-Recall Curve - Stage {stage_name}')
+            axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # Save plot
+    plot_path = f'{output_dir}/confusion_auc_calibration_stage_{stage_name}.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f" Confusion matrix, AUC curves, and calibration curve saved: {plot_path}")
+
+
+def save_misclassified_samples(model, X_test, y_test, stage_name, output_dir, original_test_data=None):
+    """
+    ذخیره رکوردهای اشتباه پیش‌بینی شده در فایل اکسل
+    """
+    print(f"\n📊 Extracting misclassified samples for stage {stage_name}...")
+
+    # پیش‌بینی مدل
+    y_pred = model.predict(X_test)
+
+    # اطمینان از فرمت مناسب برای y_test
+    if hasattr(y_test, 'values'):
+        y_test_values = y_test.values
+    else:
+        y_test_values = y_test
+
+    # پیدا کردن اندیس‌های اشتباه
+    misclassified_indices = np.where(y_pred != y_test_values)[0]
+
+    if len(misclassified_indices) == 0:
+        print(f"   No misclassified samples found for stage {stage_name}")
+        return None
+
+    print(f"   Found {len(misclassified_indices)} misclassified samples")
+
+    # ایجاد DataFrame برای رکوردهای اشتباه
+    misclassified_data = []
+
+    for idx in misclassified_indices:
+        # دریافت داده‌های اصلی
+        if original_test_data is not None:
+            original_row = original_test_data.iloc[idx].to_dict()
+        else:
+            original_row = {}
+
+        # اطلاعات پیش‌بینی
+        prediction_info = {
+            'Index': idx,
+            'Actual_Target': y_test_values[idx],
+            'Predicted_Target': y_pred[idx],
+            'Stage': stage_name
+        }
+
+        # ترکیب اطلاعات
+        row_data = {**prediction_info, **original_row}
+        misclassified_data.append(row_data)
+
+    # ایجاد DataFrame
+    df_misclassified = pd.DataFrame(misclassified_data)
+
+    # ذخیره در فایل اکسل
+    output_path = f'{output_dir}/misclassified_samples_stage_{stage_name}.xlsx'
+    df_misclassified.to_excel(output_path, index=False)
+    print(f"   Misclassified samples saved: {output_path}")
+
+    # نمایش آماری
+    print(f"\n   Misclassification statistics for stage {stage_name}:")
+    misclassification_counts = df_misclassified.groupby(['Actual_Target', 'Predicted_Target']).size().reset_index(
+        name='Count')
+    print(misclassification_counts.to_string(index=False))
+
+    return df_misclassified
+
+
+def evaluate_final_model_comprehensive(model, X_train, y_train, X_test, y_test, model_name, output_dir, stage_name,
+                                       apply_smote=False):
+    """
+    Comprehensive evaluation of final model with misclassified samples saving
+    """
+    print("\n" + "=" * 70)
+    print(f" Comprehensive Evaluation of Model {model_name}")
+    if apply_smote:
+        print(" Note: Model trained with SMOTE")
+    print("=" * 70)
+
+    # برای مدل‌های با SMOTE، ابتدا آموزش دهید
+    model.fit(X_train, y_train)
+
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_pred_train = model.predict(X_train)
+
+    # ======== بخش جدید: ذخیره رکوردهای اشتباه ========
+    print(f"\n📊 Extracting misclassified samples...")
+
+    # تبدیل y_test به فرمت مناسب
+    if hasattr(y_test, 'values'):
+        y_test_values = y_test.values
+    else:
+        y_test_values = y_test
+
+    # پیدا کردن اندیس‌های اشتباه
+    misclassified_indices = np.where(y_pred != y_test_values)[0]
+
+    if len(misclassified_indices) > 0:
+        print(f"   Found {len(misclassified_indices)} misclassified samples")
+
+        # ایجاد DataFrame برای رکوردهای اشتباه
+        misclassified_data = []
+
+        for idx in misclassified_indices:
+            # ایجاد دیکشنری برای هر رکورد
+            row_data = {
+                'Index': idx,
+                'Actual_Target': y_test_values[idx],
+                'Predicted_Target': y_pred[idx],
+                'Stage': stage_name
+            }
+
+            # اضافه کردن مقادیر ویژگی‌ها
+            if hasattr(X_test, 'iloc'):
+                sample = X_test.iloc[idx]
+                for feature in X_test.columns:
+                    row_data[feature] = sample[feature]
+            else:
+                sample = X_test[idx]
+                for i, feature in enumerate(X_test.columns if hasattr(X_test, 'columns') else range(X_test.shape[1])):
+                    row_data[f'Feature_{i}'] = sample[i]
+
+            # اضافه کردن احتمالات اگر موجود باشد
+            if hasattr(model, 'predict_proba'):
+                proba = model.predict_proba(X_test.iloc[[idx]] if hasattr(X_test, 'iloc') else X_test[[idx]])
+                for i, prob in enumerate(proba[0]):
+                    row_data[f'Probability_Class_{i}'] = prob
+
+            misclassified_data.append(row_data)
+
+        # ایجاد DataFrame و ذخیره در فایل
+        df_misclassified = pd.DataFrame(misclassified_data)
+        misclassified_path = f'{output_dir}/misclassified_samples_stage_{stage_name}.xlsx'
+        df_misclassified.to_excel(misclassified_path, index=False)
+        print(f"   Misclassified samples saved: {misclassified_path}")
+
+        # نمایش آماری خطاها
+        error_counts = df_misclassified.groupby(['Actual_Target', 'Predicted_Target']).size().reset_index(name='Count')
+        print(f"\n   Misclassification pattern:")
+        for _, row in error_counts.iterrows():
+            print(f"     Actual {row['Actual_Target']} → Predicted {row['Predicted_Target']}: {row['Count']} samples")
+    else:
+        print(f"   No misclassified samples found")
+    # ======== پایان بخش جدید ========
+
+    # Probabilities for AUC
+    y_proba = None
+    if hasattr(model, 'predict_proba'):
+        y_proba = model.predict_proba(X_test)
+
+    # Calculate main metrics
+    train_accuracy = accuracy_score(y_train, y_pred_train)
+    test_accuracy = accuracy_score(y_test, y_pred)
+    train_f1 = f1_score(y_train, y_pred_train, average='weighted')
+    test_f1 = f1_score(y_test, y_pred, average='weighted')
+
+    # Calculate AUC for each class
+    auc_scores = {}
+    if y_proba is not None:
+        try:
+            unique_classes = np.unique(y_test)
+            if len(unique_classes) > 2:
+                # Multi-class AUC
+                auc_scores['macro'] = roc_auc_score(y_test, y_proba, average='macro', multi_class='ovr')
+                auc_scores['weighted'] = roc_auc_score(y_test, y_proba, average='weighted', multi_class='ovr')
+            else:
+                # Binary AUC - handle non-0/1 labels
+                le = LabelEncoder()
+                y_test_encoded = le.fit_transform(y_test)
+                auc_scores['binary'] = roc_auc_score(y_test_encoded, y_proba[:, 1])
+        except Exception as e:
+            auc_scores = {'error': str(e)}
+
+    # Cross-Validation با مدیریت صحیح SMOTE
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    if apply_smote and hasattr(model, 'named_steps'):
+        # برای مدل‌های pipeline با SMOTE
+        cv_pipeline = ImbPipeline([
+            ('smote', SMOTE(random_state=42)),
+            ('classifier', model.named_steps['rf'] if 'rf' in model.named_steps else model.named_steps['classifier'])
+        ])
+        cv_scores = cross_val_score(cv_pipeline, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
+    else:
+        # برای مدل‌های معمولی
+        cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
+
+    cv_mean = np.mean(cv_scores)
+    cv_std = np.std(cv_scores)
+
+    # Calculate F1 for each class
+    class_report = classification_report(y_test, y_pred, output_dict=True)
+
+    print(f"\n Model {model_name} Performance:")
+    print("-" * 50)
+    print(f"   Train Accuracy:           {train_accuracy:.4f}")
+    print(f"   Test Accuracy:            {test_accuracy:.4f}")
+    print(f"   Weighted F1 Train:        {train_f1:.4f}")
+    print(f"   Weighted F1 Test:         {test_f1:.4f}")
+    print(f"   CV Accuracy (5-fold):     {cv_mean:.4f} ± {cv_std:.4f}")
+
+    # Display AUC
+    if auc_scores:
+        print(f"\n   AUC Scores:")
+        for key, value in auc_scores.items():
+            if isinstance(value, (int, float)):
+                print(f"     {key}: {value:.4f}")
+            else:
+                print(f"     {key}: {value}")
+
+    # Check overfitting
+    overfit_gap = train_accuracy - test_accuracy
+    print(f"\n    Overfitting Check:")
+    print(f"     Train/Test Difference: {overfit_gap:.4f}")
+    if overfit_gap > 0.15:
+        print("       Warning: High overfitting risk")
+    elif overfit_gap > 0.1:
+        print("      ️ Notice: Significant difference")
+    elif overfit_gap > 0.05:
+        print("      ️ Moderate difference")
+    else:
+        print("       Acceptable difference")
+
+    # Detailed classification report
+    print(f"\n Classification Report (Test):")
+    print("-" * 50)
+    print(classification_report(y_test, y_pred))
+
+    # Display confusion matrix numerically
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"\n Confusion Matrix:")
+    print("-" * 30)
+    for i in range(cm.shape[0]):
+        row = '  '.join([f'{val:3d}' for val in cm[i]])
+        print(f"  {row}")
+
+    # Plot confusion matrix, AUC curves, and calibration curve
+    plot_confusion_matrix_auc_curves(
+        model, X_train, y_train, X_test, y_test, model_name, output_dir, stage_name
+    )
+
+    results = {
+        'model_name': model_name,
+        'train_accuracy': train_accuracy,
+        'test_accuracy': test_accuracy,
+        'train_f1': train_f1,
+        'test_f1': test_f1,
+        'cv_mean': cv_mean,
+        'cv_std': cv_std,
+        'overfit_gap': overfit_gap,
+        'auc_scores': auc_scores,
+        'classification_report': class_report,
+        'confusion_matrix': cm.tolist(),
+        'smote_applied': apply_smote,
+        'misclassified_count': len(misclassified_indices)  # اضافه کردن تعداد خطاها
+    }
+
+    return results
+
+
+def perform_shap_analysis(model, X_train, X_test, feature_names, output_dir, stage_name, y_test):
+    """
+    SHAP analysis for model
+    """
+    print(f"\n" + "=" * 70)
+    print(f" SHAP Analysis - Stage {stage_name}")
+    print("=" * 70)
+
+    try:
+        # Extract model if it's a Pipeline
+        if hasattr(model, 'steps'):
+            for step_name, step_model in model.steps:
+                if isinstance(step_model, (CatBoostClassifier, RandomForestClassifier)):
+                    rf_model = step_model
+                    break
+            else:
+                rf_model = model
+        else:
+            rf_model = model
+
+        # Create SHAP explainer
+        if isinstance(rf_model, CatBoostClassifier):
+            explainer = shap.TreeExplainer(rf_model)
+        else:
+            explainer = shap.TreeExplainer(rf_model)
+
+        # Calculate SHAP values for test data
+        shap_values = explainer.shap_values(X_test)
+
+        # 1. Summary plot (bar chart)
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(shap_values, X_test, feature_names=feature_names, plot_type="bar", show=False)
+        plt.title(f"SHAP Feature Importance - Stage {stage_name}", fontsize=14)
+        plt.tight_layout()
+        summary_bar_path = f'{output_dir}/shap_summary_bar_stage_{stage_name}.png'
+        plt.savefig(summary_bar_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f" SHAP summary plot saved: {summary_bar_path}")
+
+        # 2. Beeswarm plot (corrected for both stages)
+        plt.figure(figsize=(14, 10))
+        if isinstance(shap_values, list):
+            # For multi-class models
+            shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
+        else:
+            # For binary models
+            shap.summary_plot(shap_values, X_test, feature_names=feature_names, show=False)
+        plt.title(f"SHAP Beeswarm Plot - Stage {stage_name}", fontsize=14)
+        plt.tight_layout()
+        summary_beeswarm_path = f'{output_dir}/shap_beeswarm_stage_{stage_name}.png'
+        plt.savefig(summary_beeswarm_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f" SHAP beeswarm plot saved: {summary_beeswarm_path}")
+
+        # 3. Waterfall plots for all classes
+        print(f"\n Creating Waterfall plots for all classes...")
+
+        # Get predicted classes
+        y_pred = model.predict(X_test)
+        unique_classes = np.unique(y_pred)
+
+        for cls in unique_classes:
+            # Find indices for this class prediction
+            class_indices = np.where(y_pred == cls)[0]
+
+            if len(class_indices) > 0:
+                idx = class_indices[0]
+                try:
+                    if isinstance(shap_values, list):
+                        # Multi-class - find the right index for this class
+                        # Map class value to index in shap_values list
+                        cls_idx = np.where(unique_classes == cls)[0][0]
+                        if cls_idx < len(shap_values):
+                            sample_shap_values = shap_values[cls_idx][idx]
+                            base_value = explainer.expected_value[cls_idx] if hasattr(explainer.expected_value,
+                                                                                      '__len__') else explainer.expected_value
+                        else:
+                            sample_shap_values = shap_values[0][idx]
+                            base_value = explainer.expected_value[0] if hasattr(explainer.expected_value,
+                                                                                '__len__') else explainer.expected_value
+                    else:
+                        # Binary
+                        sample_shap_values = shap_values[idx]
+                        base_value = explainer.expected_value
+
+                    plt.figure(figsize=(14, 8))
+                    shap.waterfall_plot(
+                        shap.Explanation(
+                            values=sample_shap_values,
+                            base_values=base_value,
+                            data=X_test.iloc[idx].values,
+                            feature_names=feature_names
+                        ),
+                        max_display=15,
+                        show=False
+                    )
+                    actual_label = y_test.iloc[idx] if hasattr(y_test, 'iloc') else y_test[idx]
+                    plt.title(f"SHAP Waterfall Plot - Sample {idx}\nPredicted: Class {cls}, Actual: {actual_label}",
+                              fontsize=14)
+                    plt.tight_layout()
+                    waterfall_path = f'{output_dir}/shap_waterfall_class{cls}_stage_{stage_name}.png'
+                    plt.savefig(waterfall_path, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print(f" Waterfall plot for class {cls} saved: {waterfall_path}")
+                except Exception as e:
+                    print(f" Error creating waterfall plot for class {cls}: {e}")
+
+        # 4. Waterfall plots for misclassified samples
+        print(f"\n Creating Waterfall plots for misclassified samples...")
+        idx, sample, true_label, pred_label = find_misclassified_sample(model, X_test, y_test)
+
+        if idx is not None:
+            print(f"   Found misclassified sample:")
+            print(f"   Sample {idx}: Actual={true_label}, Predicted={pred_label}")
+
+            try:
+                # Calculate SHAP values for this sample
+                if isinstance(shap_values, list):
+                    # For multi-class models
+                    # Find index of predicted class in unique classes
+                    unique_classes_pred = np.unique(y_pred)
+                    cls_idx = np.where(unique_classes_pred == pred_label)[0][
+                        0] if pred_label in unique_classes_pred else 0
+                    if cls_idx < len(shap_values):
+                        sample_shap_values = shap_values[cls_idx][idx]
+                        base_value = explainer.expected_value[cls_idx] if hasattr(explainer.expected_value,
+                                                                                  '__len__') else explainer.expected_value
+                    else:
+                        sample_shap_values = shap_values[0][idx]
+                        base_value = explainer.expected_value[0] if hasattr(explainer.expected_value,
+                                                                            '__len__') else explainer.expected_value
+                else:
+                    # For binary models
+                    sample_shap_values = shap_values[idx]
+                    base_value = explainer.expected_value
+
+                # Create waterfall plot
+                plt.figure(figsize=(14, 8))
+                shap.waterfall_plot(
+                    shap.Explanation(
+                        values=sample_shap_values,
+                        base_values=base_value,
+                        data=X_test.iloc[idx].values,
+                        feature_names=feature_names
+                    ),
+                    max_display=15,
+                    show=False
+                )
+                plt.title(
+                    f"SHAP Waterfall Plot - Misclassified Sample {idx}\n(Actual: {true_label}, Predicted: {pred_label})",
+                    fontsize=14)
+                plt.tight_layout()
+                waterfall_path_mis = f'{output_dir}/shap_waterfall_misclassified_stage_{stage_name}.png'
+                plt.savefig(waterfall_path_mis, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f" Waterfall plot for misclassified sample saved: {waterfall_path_mis}")
+
+            except Exception as e:
+                print(f" Error creating waterfall plot for misclassified sample: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # 5. Save SHAP values to Excel
+        if isinstance(shap_values, list):
+            # For multi-class models
+            shap_dict = {}
+            for i in range(len(shap_values)):
+                shap_dict[f'SHAP_Class_{i}'] = shap_values[i].mean(axis=0)
+
+            shap_df = pd.DataFrame(shap_dict, index=feature_names)
+        else:
+            # For binary models
+            shap_df = pd.DataFrame(shap_values.mean(axis=0),
+                                   columns=['SHAP_Value'],
+                                   index=feature_names)
+
+        shap_excel_path = f'{output_dir}/shap_values_stage_{stage_name}.xlsx'
+        shap_df.to_excel(shap_excel_path)
+        print(f" SHAP values saved: {shap_excel_path}")
+
+        print(f" SHAP analysis for stage {stage_name} completed successfully")
+
+    except Exception as e:
+        print(f" Error in SHAP analysis: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def train_two_stage_model(X_train, X_test, y_train, y_test, target_name, output_dir):
+    """
+    Train two-stage model: Stage 1 with CatBoost, Stage 2 with RandomForest
+    """
+    print("\n" + "=" * 80)
+    print(" Starting Advanced Two-Stage Model Training")
+    print("=" * 80)
+    print(" Stage 1: CatBoost (Need for Injection Detection)")
+    print(" Stage 2: RandomForest (Number of Injections Detection) WITH SMOTE")
+    print(" Goal: Reaching PyCaret accuracy or better in Scikit-learn")
+    print("=" * 80)
+
+    # Store stage results
+    stage_results = {}
+
+    # ========== Stage 1: Need for Injection Detection (CatBoost) ==========
+    print("\n Stage 1: Need for Injection Detection - CatBoost")
+    print("-" * 50)
+
+    # Reconstruct labels for stage 1 (binary)
+    y_train_stage1 = y_train.copy()
+    y_test_stage1 = y_test.copy()
+
+    # Convert to binary problem: 0 = no need, 1 = need for injection (includes 1 and 2)
+    y_train_stage1 = y_train_stage1.apply(lambda x: 0 if x == 0 else 1)
+    y_test_stage1 = y_test_stage1.apply(lambda x: 0 if x == 0 else 1)
+
+    print(f"Class distribution in stage 1:")
+    print(f"  Class 0 (no need for injection): {sum(y_train_stage1 == 0)} samples")
+    print(f"  Class 1 (need for injection): {sum(y_train_stage1 == 1)} samples")
+
+    # Find best model with PyCaret for stage 1 and get its accuracy
+    print("\n Finding best model for stage 1 with PyCaret...")
+    best_model_stage1_pycaret, model_name_stage1 = find_best_model_with_pycaret(
+        X_train, y_train_stage1, 'target_stage1', "stage1_experiment"
+    )
+
+    # Evaluate PyCaret model to get its accuracy
+    from sklearn.model_selection import cross_val_score
+    cv_scores_pycaret = cross_val_score(best_model_stage1_pycaret, X_train, y_train_stage1,
+                                        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+                                        scoring='accuracy')
+    pycaret_accuracy_stage1 = np.mean(cv_scores_pycaret)
+    print(f"\n PyCaret accuracy for stage 1: {pycaret_accuracy_stage1:.4f}")
+
+    # Advanced CatBoost optimization for stage 1
+    print("\n🔧 Advanced optimization of stage 1 model with CatBoost...")
+    optimized_model_stage1, best_params_stage1 = optimize_catboost_with_sklearn_advanced(
+        X_train, y_train_stage1, pycaret_accuracy_stage1
+    )
+
+    # Evaluate stage 1 model
+    print("\n Evaluating stage 1 model (CatBoost)...")
+    results_stage1 = evaluate_final_model_comprehensive(
+        optimized_model_stage1,
+        X_train, y_train_stage1,
+        X_test, y_test_stage1,
+        f"Stage1_CatBoost",
+        output_dir,
+        "1",
+        apply_smote=False
+    )
+
+    # Feature importance analysis for stage 1
+    importance_stage1 = perform_feature_importance_analysis(
+        optimized_model_stage1,
+        X_train, X_test,
+        X_train.columns.tolist(),
+        output_dir,
+        "1"
+    )
+
+    # SHAP analysis for stage 1
+    perform_shap_analysis(
+        optimized_model_stage1,
+        X_train, X_test,
+        X_train.columns.tolist(),
+        output_dir,
+        "1",
+        y_test_stage1
+    )
+
+    # Save stage 1 model (CatBoost)
+    stage1_model_path = f'{output_dir}/stage1_catboost_model.joblib'
+    joblib.dump(optimized_model_stage1, stage1_model_path)
+    print(f"💾 Stage 1 model (CatBoost) saved: {stage1_model_path}")
+
+    # ========== Stage 2: Number of Injections Detection (RandomForest) ==========
+    print("\n\n Stage 2: Number of Injections Detection - RandomForest")
+    print("-" * 50)
+
+    # Filter data that need injection (classes 1 and 2)
+    mask_train_stage2 = y_train >= 1
+    mask_test_stage2 = y_test >= 1
+
+    X_train_stage2 = X_train[mask_train_stage2].copy()
+    y_train_stage2 = y_train[mask_train_stage2].copy()
+    X_test_stage2 = X_test[mask_test_stage2].copy()
+    y_test_stage2 = y_test[mask_test_stage2].copy()
+
+    # Ensure at least two classes exist
+    if len(np.unique(y_train_stage2)) < 2:
+        print(" Insufficient data for stage 2")
+        stage_results['stage1'] = results_stage1
+        stage_results['stage2'] = None
+        return stage_results
+
+    print(f" Class distribution in stage 2 (ORIGINAL):")
+    unique_classes = np.unique(y_train_stage2)
+    for cls in unique_classes:
+        count = sum(y_train_stage2 == cls)
+        percentage = count / len(y_train_stage2) * 100
+        print(
+            f"  Class {cls} ({'one time' if cls == 1 else 'two times'} injection): {count} samples ({percentage:.1f}%)")
+
+    # Find best model with PyCaret for stage 2 and get its accuracy (روی داده‌های اصلی)
+    print("\n Finding best model for stage 2 with PyCaret...")
+    best_model_stage2_pycaret, model_name_stage2 = find_best_model_with_pycaret(
+        X_train_stage2, y_train_stage2, 'target_stage2', "stage2_experiment"
+    )
+
+    # Evaluate PyCaret model to get its accuracy
+    cv_scores_pycaret_stage2 = cross_val_score(best_model_stage2_pycaret, X_train_stage2, y_train_stage2,
+                                               cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+                                               scoring='accuracy')
+    pycaret_accuracy_stage2 = np.mean(cv_scores_pycaret_stage2)
+    print(f"\n PyCaret accuracy for stage 2: {pycaret_accuracy_stage2:.4f}")
+
+    # Advanced RandomForest optimization for stage 2 با اعمال SMOTE صحیح
+    print("\n🔧 Advanced optimization of stage 2 model with RandomForest (with SMOTE)...")
+    optimized_model_stage2, best_params_stage2 = optimize_randomforest_with_sklearn_advanced(
+        X_train_stage2, y_train_stage2, pycaret_accuracy_stage2, apply_smote=True
+    )
+
+    # Evaluate stage 2 model
+    print("\n Evaluating stage 2 model (RandomForest with SMOTE)...")
+    results_stage2 = evaluate_final_model_comprehensive(
+        optimized_model_stage2,
+        X_train_stage2, y_train_stage2,
+        X_test_stage2, y_test_stage2,
+        f"Stage2_RandomForest_with_SMOTE",
+        output_dir,
+        "2",
+        apply_smote=True
+    )
+
+    # Feature importance analysis for stage 2
+    importance_stage2 = perform_feature_importance_analysis(
+        optimized_model_stage2,
+        X_train_stage2, X_test_stage2,
+        X_train_stage2.columns.tolist(),
+        output_dir,
+        "2"
+    )
+
+    # SHAP analysis for stage 2
+    perform_shap_analysis(
+        optimized_model_stage2,
+        X_train_stage2, X_test_stage2,
+        X_train_stage2.columns.tolist(),
+        output_dir,
+        "2",
+        y_test_stage2
+    )
+
+    # Save stage 2 model (RandomForest)
+    stage2_model_path = f'{output_dir}/stage2_randomforest_model.joblib'
+    joblib.dump(optimized_model_stage2, stage2_model_path)
+    print(f" Stage 2 model (RandomForest with SMOTE) saved: {stage2_model_path}")
+
+    # Save optimal parameters for each stage
+    params_df_stage1 = pd.DataFrame([best_params_stage1])
+    params_df_stage1.to_excel(f'{output_dir}/best_params_stage1_catboost.xlsx', index=False)
+
+    params_df_stage2 = pd.DataFrame([best_params_stage2])
+    params_df_stage2.to_excel(f'{output_dir}/best_params_stage2_randomforest.xlsx', index=False)
+
+    # Save evaluation results
+    results_df_stage1 = pd.DataFrame([results_stage1])
+    results_df_stage1.to_excel(f'{output_dir}/evaluation_results_stage1_catboost.xlsx', index=False)
+
+    results_df_stage2 = pd.DataFrame([results_stage2])
+    results_df_stage2.to_excel(f'{output_dir}/evaluation_results_stage2_randomforest.xlsx', index=False)
+
+    # Save accuracy comparison PyCaret vs Scikit-learn
+    comparison_df = pd.DataFrame({
+        'Stage': ['Stage 1', 'Stage 2'],
+        'PyCaret_Accuracy': [pycaret_accuracy_stage1, pycaret_accuracy_stage2],
+        'Scikit_Learn_CV_Accuracy': [results_stage1['cv_mean'], results_stage2['cv_mean']],
+        'Scikit_Learn_Test_Accuracy': [results_stage1['test_accuracy'], results_stage2['test_accuracy']],
+        'CV_Test_Difference': [results_stage1['cv_mean'] - results_stage1['test_accuracy'],
+                               results_stage2['cv_mean'] - results_stage2['test_accuracy']],
+        'SMOTE_Applied': ['No', 'Yes']
+    })
+    comparison_df.to_excel(f'{output_dir}/accuracy_comparison_pycaret_vs_sklearn.xlsx', index=False)
+
+    print(f"\n PyCaret vs Scikit-learn Accuracy Comparison:")
+    print("-" * 70)
+    print(comparison_df.to_string(index=False))
+
+    stage_results['stage1'] = results_stage1
+    stage_results['stage2'] = results_stage2
+    stage_results['models'] = {
+        'stage1': optimized_model_stage1,
+        'stage2': optimized_model_stage2
+    }
+
+    return stage_results
+
+
+def main():
+    print("=" * 80)
+    print(" Complete Package: Advanced Two-Stage Model with Detailed Analysis")
+    print("=" * 80)
+    print(" Stage 1: CatBoost (Need for Injection Detection)")
+    print(" Stage 2: RandomForest (Number of Injections Detection) WITH SMOTE")
+    print(" Goal: Reaching PyCaret accuracy or better in Scikit-learn")
+    print("=" * 80)
+
+    # 1. Create output directory
+    output_dir = f"advanced_two_stage_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n Output directory: {output_dir}")
+
+    # 2. Read data
+    print("\n Reading data...")
+    try:
+        df = pd.read_excel('RDS_encoded_data.xlsx')
+        print(f" Data loaded: {df.shape}")
+        print(f"   Columns: {list(df.columns)}")
+    except Exception as e:
+        print(f" Error reading file: {e}")
+        print(" Make sure 'RDS_encoded_data.xlsx' exists in current directory")
+        return
+
+    # 3. Determine target column
+    target = 'Surfactant_Administered'
+
+    if target not in df.columns:
+        print(f" Target column '{target}' not found in data")
+        print(f"   Available columns: {list(df.columns)}")
+        possible_targets = [col for col in df.columns if 'Surfactant' in col or 'surfactant' in col]
+        if possible_targets:
+            print(f"\n Related columns found: {possible_targets}")
+            target = possible_targets[0]
+            print(f"   Using '{target}' as target column")
+        else:
+            return
+
+    # 4. Remove unnecessary columns
+    print("\n Removing unnecessary columns...")
+    columns_to_drop = ['Patient_ID', 'Date', 'Surfactant_Group']
+    existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
+
+    if existing_columns_to_drop:
+        df = df.drop(columns=existing_columns_to_drop)
+        print(f" Removed columns: {existing_columns_to_drop}")
+    else:
+        print("️ None of the unnecessary columns found")
+
+    # 5. Remove rows with NaN values
+    print("\n Cleaning data...")
+    initial_shape = df.shape
+    df_clean = df.dropna()
+    print(f" Clean data: {df_clean.shape}")
+    print(f"   {initial_shape[0] - df_clean.shape[0]} rows with NaN values removed")
+
+    # Check class distribution
+    print(f"\n Class distribution of '{target}':")
+    class_dist = df_clean[target].value_counts()
+    for cls, count in class_dist.items():
+        percentage = count / len(df_clean) * 100
+        print(f"   Class {cls}: {count} samples ({percentage:.1f}%)")
+
+    # 6. Discretization (only on selected columns)
+    print("\n" + "=" * 70)
+    print(" Step: Numerical Feature Discretization")
+    print("=" * 70)
+
+    df_discretized, disc_info = discretize_selected_features(
+        df_clean,
+        target,
+        NUMERICAL_COLS_FOR_DISCRETIZATION,
+        n_bins=5,
+        strategy='quantile'
+    )
+
+    # Save discretization info
+    if disc_info:
+        disc_info_df = pd.DataFrame([{
+            'Strategy': disc_info['strategy'],
+            'Number of bins': disc_info['n_bins'],
+            'Number of discretized features': len(disc_info['features_discretized']),
+            'Discretized features': ', '.join(disc_info['features_discretized'])
+        }])
+        disc_info_df.to_excel(f'{output_dir}/discretization_info.xlsx', index=False)
+
+    # 7. Split data into Train/Test
+    print("\n" + "=" * 70)
+    print(" Step: Train/Test Split")
+    print("=" * 70)
+
+    X = df_discretized.drop(columns=[target])
+    y = df_discretized[target]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    print(f" Train data: {X_train.shape} ({len(y_train)} samples)")
+    print(f" Test data:  {X_test.shape} ({len(y_test)} samples)")
+    print(f" Number of features: {X_train.shape[1]}")
+
+    # Save split data
+    train_data = pd.concat([X_train, y_train], axis=1)
+    test_data = pd.concat([X_test, y_test], axis=1)
+    train_data.to_excel(f'{output_dir}/train_data.xlsx', index=False)
+    test_data.to_excel(f'{output_dir}/test_data.xlsx', index=False)
+
+    # 8. Train advanced two-stage model
+    print("\n" + "=" * 70)
+    print(" Step: Advanced Two-Stage Model Training")
+    print("=" * 70)
+
+    results = train_two_stage_model(
+        X_train, X_test, y_train, y_test,
+        target, output_dir
+    )
+
+    # 9. Final report
+    print("\n" + "=" * 80)
+    print(" Final Report: Advanced Two-Stage Model")
+    print("=" * 80)
+
+    print(f"\n Steps completed:")
+    print(f"   1.  Discretization of {len(disc_info.get('features_discretized', []))} numerical columns")
+    print(f"   2.  Data split: Train={len(X_train)} samples, Test={len(X_test)} samples")
+    print(f"   3.  Advanced two-stage model training:")
+    print(f"      • Stage 1: Need for injection detection (CatBoost with advanced optimization)")
+    print(f"      • Stage 2: Number of injections detection (RandomForest with advanced optimization + SMOTE)")
+    print(f"   4.  SHAP analysis for each stage (with Waterfall and Beeswarm plots)")
+    print(f"   5.  Confusion matrix, AUC curves, and calibration curve for each stage")
+    print(f"   6.  PyCaret vs Scikit-learn accuracy comparison")
+    print(f"   7.  All models and results saved")
+
+    if results['stage1']:
+        print(f"\n Stage 1 Performance (CatBoost - Need for Injection Detection):")
+        print(f"    Test Accuracy:            {results['stage1']['test_accuracy']:.4f}")
+        print(f"    Weighted F1 Test:         {results['stage1']['test_f1']:.4f}")
+        print(f"    CV Accuracy (5-fold):     {results['stage1']['cv_mean']:.4f} ± {results['stage1']['cv_std']:.4f}")
+        print(f"   ️  Train/Test Difference:    {results['stage1']['overfit_gap']:.4f}")
+
+    if results['stage2']:
+        print(f"\n Stage 2 Performance (RandomForest - Number of Injections Detection with SMOTE):")
+        print(f"    Test Accuracy:            {results['stage2']['test_accuracy']:.4f}")
+        print(f"    Weighted F1 Test:         {results['stage2']['test_f1']:.4f}")
+        print(f"    CV Accuracy (5-fold):     {results['stage2']['cv_mean']:.4f} ± {results['stage2']['cv_std']:.4f}")
+        print(f"     Train/Test Difference:    {results['stage2']['overfit_gap']:.4f}")
+        print(
+            f"    CV-Test Difference:        {results['stage2']['cv_mean'] - results['stage2']['test_accuracy']:.4f}")
+
+    print(f"\n Files generated in {output_dir}/:")
+    files = [
+        'discretization_info.xlsx',
+        'train_data.xlsx',
+        'test_data.xlsx',
+        'stage1_catboost_model.joblib',
+        'stage2_randomforest_model.joblib',
+        'best_params_stage1_catboost.xlsx',
+        'best_params_stage2_randomforest.xlsx',
+        'evaluation_results_stage1_catboost.xlsx',
+        'evaluation_results_stage2_randomforest.xlsx',
+        'accuracy_comparison_pycaret_vs_sklearn.xlsx',
+        'feature_importance_stage_1.xlsx',
+        'feature_importance_stage_2.xlsx',
+        'confusion_auc_calibration_stage_1.png',
+        'confusion_auc_calibration_stage_2.png',
+        'shap_summary_bar_stage_1.png',
+        'shap_summary_bar_stage_2.png',
+        'shap_beeswarm_stage_1.png',
+        'shap_beeswarm_stage_2.png',
+        'shap_waterfall_class0_stage_1.png',
+        'shap_waterfall_class1_stage_1.png',
+        'shap_waterfall_class1_stage_2.png',
+        'shap_waterfall_class2_stage_2.png',
+        'shap_waterfall_misclassified_stage_1.png',
+        'shap_waterfall_misclassified_stage_2.png',
+        'shap_values_stage_1.xlsx',
+        'shap_values_stage_2.xlsx'
+    ]
+
+    for file in files:
+        print(f"   • {file}")
+
+    print("\n How to use the two-stage hybrid model:")
+    print("   1. First use stage1_catboost_model.joblib to detect need for injection")
+    print(
+        "   2. If result indicates need for injection, use stage2_randomforest_model.joblib to detect number of injections")
+    print("\n Important Note about Stage 2:")
+    print("   - SMOTE is applied during training to balance the classes")
+    print("   - This helps the model learn from minority class examples")
+    print("   - Test data remains untouched (no SMOTE applied to test)")
+
+    print("\n" + "=" * 80)
+    print(" Advanced two-stage model successfully trained and analyzed!")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    # Check required packages installation
+    required_packages = {
+        'pycaret': 'PyCaret',
+        'catboost': 'CatBoost',
+        'shap': 'SHAP',
+        'imblearn': 'Imbalanced-Learn'
+    }
+
+    missing_packages = []
+    for package, name in required_packages.items():
+        try:
+            __import__(package)
+            print(f" {name} is installed")
+        except ImportError:
+            missing_packages.append((package, name))
+
+    if missing_packages:
+        print("\n Missing packages:")
+        for package, name in missing_packages:
+            print(f"   - {name} ({package})")
+        print("\nTo install missing packages run:")
+        for package, name in missing_packages:
+            print(f"   pip install {package}")
+
+        # پیشنهاد نصب همه بسته‌های لازم
+        print("\n💡 You can install all required packages at once:")
+        print("   pip install pycaret catboost shap imbalanced-learn")
+
+        exit()
+
+    main()
