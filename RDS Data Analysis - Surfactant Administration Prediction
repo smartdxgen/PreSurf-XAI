@@ -1,0 +1,968 @@
+# =============================================================================
+#  RDS Data Analysis - Surfactant Administration Prediction
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import chi2_contingency, f_oneway, kruskal, ttest_ind, shapiro, levene, mannwhitneyu
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['axes.unicode_minus'] = False
+
+print(" Starting RDS Data Analysis for Surfactant Administration Prediction...")
+
+
+# =============================================================================
+#  1. Read Data
+# =============================================================================
+
+def read_data(file_path):
+    """Read Excel file"""
+    try:
+        df = pd.read_excel(file_path)
+        print(f" File read successfully. Shape: {df.shape}")
+        print(f" Rows: {len(df)}, Columns: {len(df.columns)}")
+
+        # Show first few rows
+        print("\n Sample data (first 3 rows):")
+        print(df.head(3))
+
+        # Show column names
+        print("\n Column names:")
+        for i, col in enumerate(df.columns):
+            print(f"  {i + 1:2d}. {col}")
+
+        return df
+    except Exception as e:
+        print(f" Error reading file: {e}")
+        return None
+
+
+# =============================================================================
+#  2. Identify Outliers (DO NOT REMOVE)
+# =============================================================================
+
+def identify_outliers(df):
+    """Identify outliers using IQR method but DO NOT remove them"""
+
+    print("\n" + "=" * 60)
+    print("Identifying Outliers (No Rows Will Be Removed)")
+    print("=" * 60)
+
+    # Define quantitative columns to check for outliers
+    quantitative_cols = [
+        'Gestational_Age_Weeks', 'Gestational_Age_Days', 'Gestational_Age_Days_total', 'Maternal_Age',
+        'Birth_Weight', 'Birth_Height', 'Head_Circumference',
+        'Umbilical_pH', 'Base_Excess', 'FiO2'
+    ]
+
+    # Only use columns that exist in the dataframe
+    columns_to_check = [col for col in quantitative_cols if col in df.columns]
+
+    outlier_summary = []
+
+    for col in columns_to_check:
+        # Calculate IQR
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+
+        # Define outlier bounds
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+
+        # Count outliers
+        outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+        outlier_count = len(outliers)
+
+        if outlier_count > 0:
+            outlier_pct = (outlier_count / len(df)) * 100
+            print(f"  {col:<25}: {outlier_count:3d} outliers ({outlier_pct:.1f}%)")
+            outlier_summary.append({
+                'Variable': col,
+                'Q1': round(Q1, 2),
+                'Q3': round(Q3, 2),
+                'IQR': round(IQR, 2),
+                'Lower_Bound': round(lower_bound, 2),
+                'Upper_Bound': round(upper_bound, 2),
+                'Outlier_Count': outlier_count,
+                'Outlier_Percentage': round(outlier_pct, 2)
+            })
+
+    print(f"\n Total rows: {len(df)}")
+    print("No rows will be removed - keeping all data for analysis")
+
+    return df, outlier_summary
+
+
+# =============================================================================
+#  3. Analyze Target Column
+# =============================================================================
+
+def analyze_target_column(df):
+    """Analyze target column (Surfactant_Administered)"""
+
+    print("\n" + "=" * 60)
+    print(" Analyzing Target Column (Surfactant_Administered)")
+    print("=" * 60)
+
+    target_col = 'Surfactant_Administered'
+
+    if target_col not in df.columns:
+        print(f" Column '{target_col}' not found!")
+        print(" Available columns:")
+        for col in df.columns:
+            print(f"  - {col}")
+        return None
+
+    # Show distribution of target column
+    target_counts = df[target_col].value_counts().sort_index()
+    total_patients = len(df)
+
+    print(f"\n Distribution of patients by surfactant administration:")
+    print("-" * 50)
+
+    summary_data = []
+
+    # Calculate exact percentages
+    for val in sorted(df[target_col].unique()):
+        count = target_counts.get(val, 0)
+        percentage = (count / total_patients) * 100
+
+        if val == 0:
+            label = "No Surfactant"
+        elif val == 1:
+            label = "1 Administration"
+        elif val == 2:
+            label = "2 Administrations"
+        else:
+            label = f"{val} Administrations"
+
+        print(f"  {label}: {count} patients ({percentage:.1f}%)")
+        summary_data.append({
+            'Group': label,
+            'Count': count,
+            'Percentage': round(percentage, 1)
+        })
+
+    # Verify total
+    print(f"\n Total patients: {total_patients}")
+    print(f" Calculated percentage sum: {sum([d['Percentage'] for d in summary_data]):.1f}%")
+
+    # Create summary table
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.loc['Total'] = ['Total', total_patients, 100.0]
+
+    return summary_df, total_patients
+
+
+# =============================================================================
+#  4. Descriptive Statistics Table
+# =============================================================================
+
+def create_descriptive_table(df):
+    """Create descriptive statistics table (mean ± SD)"""
+
+    print("\n" + "=" * 60)
+    print(" Descriptive Statistics Table (Mean ± SD)")
+    print("=" * 60)
+
+    target_col = 'Surfactant_Administered'
+
+    # Quantitative variables based on your definition
+    quantitative_cols = [
+        'Gestational_Age_Weeks', 'Gestational_Age_Days', 'Gestational_Age_Days_total', 'Maternal_Age',
+        'Birth_Weight', 'Birth_Height', 'Head_Circumference',
+        'Umbilical_pH', 'Base_Excess', 'FiO2'
+    ]
+
+    # Only columns that exist in the dataframe
+    quantitative_cols = [col for col in quantitative_cols if col in df.columns]
+
+    print(f" Identified {len(quantitative_cols)} quantitative columns")
+
+    results = []
+
+    for col in quantitative_cols:
+        row = {'Variable': col}
+
+        # Calculate for each surfactant group
+        for group_val in sorted(df[target_col].unique()):
+            group_data = df[df[target_col] == group_val][col].dropna()
+
+            if len(group_data) > 0:
+                mean_val = group_data.mean()
+                std_val = group_data.std()
+                n_val = len(group_data)
+
+                if group_val == 0:
+                    group_label = 'No_Surfactant'
+                elif group_val == 1:
+                    group_label = '1_Admin'
+                elif group_val == 2:
+                    group_label = '2_Admin'
+                else:
+                    group_label = f'Group_{group_val}'
+
+                row[f'{group_label}_Mean'] = round(mean_val, 2)
+                row[f'{group_label}_SD'] = round(std_val, 2)
+                row[f'{group_label}_N'] = n_val
+                row[f'{group_label}_Min'] = round(group_data.min(), 2)
+                row[f'{group_label}_Max'] = round(group_data.max(), 2)
+            else:
+                if group_val == 0:
+                    group_label = 'No_Surfactant'
+                elif group_val == 1:
+                    group_label = '1_Admin'
+                elif group_val == 2:
+                    group_label = '2_Admin'
+                else:
+                    group_label = f'Group_{group_val}'
+
+                row[f'{group_label}_Mean'] = np.nan
+                row[f'{group_label}_SD'] = np.nan
+                row[f'{group_label}_N'] = 0
+                row[f'{group_label}_Min'] = np.nan
+                row[f'{group_label}_Max'] = np.nan
+
+        # Calculate for total sample
+        total_data = df[col].dropna()
+        if len(total_data) > 0:
+            row['Total_Mean'] = round(total_data.mean(), 2)
+            row['Total_SD'] = round(total_data.std(), 2)
+            row['Total_N'] = len(total_data)
+            row['Total_Min'] = round(total_data.min(), 2)
+            row['Total_Max'] = round(total_data.max(), 2)
+
+        results.append(row)
+
+    descriptive_df = pd.DataFrame(results)
+
+    print(f" Descriptive table created: {len(results)} variables")
+
+    return descriptive_df
+
+
+# =============================================================================
+#  5. Normality Testing Function
+# =============================================================================
+
+def check_normality_and_homogeneity(df):
+    """Check normality and homogeneity for quantitative variables"""
+
+    print("\n" + "=" * 60)
+    print(" Checking Normality and Homogeneity Assumptions")
+    print("=" * 60)
+
+    target_col = 'Surfactant_Administered'
+
+    # Quantitative variables
+    quantitative_cols = [
+        'Gestational_Age_Weeks', 'Gestational_Age_Days', 'Gestational_Age_Days_total', 'Maternal_Age',
+        'Birth_Weight', 'Birth_Height', 'Head_Circumference',
+        'Umbilical_pH', 'Base_Excess', 'FiO2'
+    ]
+
+    quantitative_cols = [col for col in quantitative_cols if col in df.columns]
+
+    normality_results = {}
+
+    for col in quantitative_cols:
+        print(f"\n Variable: {col}")
+
+        group_data = []
+        group_labels = []
+        normality_info = {}
+
+        # Check normality for each group
+        for group_val in sorted(df[target_col].unique()):
+            data = df[df[target_col] == group_val][col].dropna().values
+
+            if len(data) >= 3:  # Shapiro test requires at least 3 samples
+                stat, p_value = shapiro(data)
+
+                group_name = {
+                    0: "No Surfactant",
+                    1: "1 Administration",
+                    2: "2 Administrations"
+                }.get(group_val, f"Group {group_val}")
+
+                is_normal = p_value > 0.05
+
+                print(f"  {group_name:<20}: n={len(data):3d}, "
+                      f"Shapiro p={p_value:.4f} ({'Normal' if is_normal else 'Not Normal'})")
+
+                normality_info[group_val] = {
+                    'n': len(data),
+                    'is_normal': is_normal,
+                    'p_value': p_value
+                }
+
+                group_data.append(data)
+                group_labels.append(group_val)
+            else:
+                print(f"  Group {group_val}: Insufficient data (n={len(data)})")
+                normality_info[group_val] = {
+                    'n': len(data),
+                    'is_normal': False,
+                    'p_value': np.nan
+                }
+
+        # Check homogeneity of variances (only if at least 2 groups have data)
+        is_homogeneous = True
+        if len(group_data) >= 2:
+            try:
+                levene_stat, levene_p = levene(*group_data)
+                is_homogeneous = levene_p > 0.05
+                print(f"  Levene's test for homogeneity: p={levene_p:.4f} "
+                      f"({'Homogeneous' if is_homogeneous else 'Not Homogeneous'})")
+            except:
+                print(f"  Levene's test: Could not compute")
+                is_homogeneous = False
+
+        normality_results[col] = {
+            'normality_info': normality_info,
+            'is_homogeneous': is_homogeneous,
+            'all_normal': all([info['is_normal'] for info in normality_info.values()
+                               if not np.isnan(info['p_value'])])
+        }
+
+    return normality_results
+
+
+# =============================================================================
+#  5. Statistical Analysis Table (P-value) with Normality Check
+# =============================================================================
+
+def create_statistical_table(df):
+    """Create statistical analysis table with proper test selection based on normality"""
+
+    print("\n" + "=" * 60)
+    print("Statistical Analysis Table (Group Comparisons)")
+    print("=" * 60)
+
+    target_col = 'Surfactant_Administered'
+
+    # First, check normality and homogeneity
+    normality_results = check_normality_and_homogeneity(df)
+
+    # Quantitative variables for analysis
+    quantitative_cols = [
+        'Gestational_Age_Weeks', 'Gestational_Age_Days', 'Gestational_Age_Days_total', 'Maternal_Age',
+        'Birth_Weight', 'Birth_Height', 'Head_Circumference',
+        'Umbilical_pH', 'Base_Excess', 'FiO2'
+    ]
+
+    # Only columns that exist
+    quantitative_cols = [col for col in quantitative_cols if col in df.columns]
+
+    results = []
+
+    for col in quantitative_cols:
+        # Separate data for groups
+        groups_data = {}
+        unique_groups = sorted(df[target_col].unique())
+
+        for group_val in unique_groups:
+            groups_data[group_val] = df[df[target_col] == group_val][col].dropna().values
+
+        # Calculate P-value
+        p_value = np.nan
+        test_used = "N/A"
+
+        # Get normality and homogeneity info for this variable
+        var_normality = normality_results.get(col, {})
+        all_normal = var_normality.get('all_normal', False)
+        is_homogeneous = var_normality.get('is_homogeneous', False)
+
+        try:
+            # Check which groups have data
+            groups_with_data = []
+            for group_val in unique_groups:
+                if len(groups_data[group_val]) > 0:
+                    groups_with_data.append(groups_data[group_val])
+
+            if len(groups_with_data) >= 2:
+                if len(groups_with_data) == 2:
+                    # Two groups: choose test based on normality
+                    if all_normal:
+                        # Normal data
+                        if is_homogeneous:
+                            # Equal variances t-test
+                            t_stat, p_value = ttest_ind(groups_with_data[0], groups_with_data[1], equal_var=True)
+                            test_used = "Independent t-test (normal, equal variances)"
+                        else:
+                            # Welch's t-test for unequal variances
+                            t_stat, p_value = ttest_ind(groups_with_data[0], groups_with_data[1], equal_var=False)
+                            test_used = "Welch's t-test (normal, unequal variances)"
+                    else:
+                        # Non-normal data: Mann-Whitney U test
+                        u_stat, p_value = mannwhitneyu(groups_with_data[0], groups_with_data[1])
+                        test_used = "Mann-Whitney U test (non-normal)"
+
+                else:
+                    # More than two groups
+                    if all_normal and is_homogeneous:
+                        # Normal and homogeneous: ANOVA
+                        f_stat, p_value = f_oneway(*groups_with_data)
+                        test_used = "ANOVA (normal, homogeneous variances)"
+                    else:
+                        # Non-normal or non-homogeneous: Kruskal-Wallis
+                        h_stat, p_value = kruskal(*groups_with_data)
+                        test_used = "Kruskal-Wallis test (non-normal or non-homogeneous)"
+
+        except Exception as e:
+            test_used = f"Calculation Error: {str(e)[:50]}"
+            p_value = np.nan
+
+        # Calculate means for each group
+        means_data = {}
+        for group_val in unique_groups:
+            if len(groups_data[group_val]) > 0:
+                means_data[f'Mean_{group_val}'] = round(groups_data[group_val].mean(), 2)
+                means_data[f'N_{group_val}'] = len(groups_data[group_val])
+            else:
+                means_data[f'Mean_{group_val}'] = np.nan
+                means_data[f'N_{group_val}'] = 0
+
+        # Determine significance
+        significant = "No"
+        significance_stars = ""
+        if not np.isnan(p_value):
+            if p_value < 0.001:
+                significant = "Yes"
+                significance_stars = "***"
+            elif p_value < 0.01:
+                significant = "Yes"
+                significance_stars = "**"
+            elif p_value < 0.05:
+                significant = "Yes"
+                significance_stars = "*"
+
+        # Create result row
+        result_row = {
+            'Variable': col,
+            'Type': 'Quantitative',
+            'Normality': 'Normal' if all_normal else 'Non-normal',
+            'Test': test_used,
+            'P_value': round(p_value, 4) if not np.isnan(p_value) else "N/A",
+            'Significant': f"{significant} {significance_stars}".strip(),
+        }
+
+        # Add means and counts
+        for group_val in unique_groups:
+            result_row[f'Mean_{group_val}'] = means_data[f'Mean_{group_val}']
+            result_row[f'N_{group_val}'] = means_data[f'N_{group_val}']
+
+        results.append(result_row)
+
+    # Analysis for qualitative (categorical) variables
+    qualitative_cols = [
+        'Delivery_Mode', 'Maternal_Diabetes', 'Maternal_Education',
+        'Maternal_Occupation', 'Treatment_Type', 'Maternal_Blood_Pressure',
+        'Substance_Use_Pregnancy', 'PROM', 'Chorioamnionitis',
+        'History_Premature_Birth', 'Antenatal_Steroid', 'Amniotic_Fluid',
+        'Fetal_Growth', 'Fetal_Distress', 'IVF', 'Multiple_Birth', 'Infant_Gender',
+        'Breathing_Condition_Birth', 'Respiratory_Distress', 'Resuscitation_Needed',
+        'Oxygen_Therapy', 'CPAP_Needed', 'PPV_Needed', 'Intubation_Needed',
+        'Cardiac_Massage_Needed', 'Medication_Given'
+    ]
+
+    qualitative_cols = [col for col in qualitative_cols if col in df.columns]
+
+    for col in qualitative_cols:
+        # Create contingency table
+        contingency = pd.crosstab(df[col], df[target_col])
+
+        # Calculate Chi-square
+        p_value = np.nan
+        test_used = "N/A"
+
+        try:
+            if contingency.shape[0] > 1 and contingency.shape[1] > 1:
+                chi2, p_value, dof, expected = chi2_contingency(contingency)
+                test_used = "Chi-square"
+            elif contingency.shape[0] == 1 or contingency.shape[1] == 1:
+                # For single row/column, can't do chi-square
+                test_used = "Cannot compute"
+                p_value = np.nan
+        except:
+            test_used = "Calculation Error"
+            p_value = np.nan
+
+        # Determine significance
+        significant = "No"
+        significance_stars = ""
+        if not np.isnan(p_value):
+            if p_value < 0.001:
+                significant = "Yes"
+                significance_stars = "***"
+            elif p_value < 0.01:
+                significant = "Yes"
+                significance_stars = "**"
+            elif p_value < 0.05:
+                significant = "Yes"
+                significance_stars = "*"
+
+        # Calculate counts in each group
+        counts_data = {}
+        for group_val in sorted(df[target_col].unique()):
+            counts_data[f'N_{group_val}'] = contingency[group_val].sum() if group_val in contingency.columns else 0
+
+        # Calculate percentages for each category (if only a few categories)
+        if len(contingency) <= 5:  # For variables with up to 5 categories
+            categories_summary = []
+            for idx in contingency.index:
+                total_cat = contingency.loc[idx].sum()
+                if total_cat > 0:
+                    cat_pct = []
+                    for group_val in sorted(df[target_col].unique()):
+                        count = contingency.loc[idx, group_val] if group_val in contingency.columns else 0
+                        pct = (count / total_cat * 100)
+                        cat_pct.append(f"{group_val}:{pct:.0f}%")
+                    categories_summary.append(f"{idx} ({'; '.join(cat_pct)})")
+
+            categories_str = "; ".join(categories_summary)
+        else:
+            categories_str = f"{len(contingency)} categories"
+
+        # Create result row
+        result_row = {
+            'Variable': col,
+            'Type': 'Qualitative',
+            'Normality': 'N/A',
+            'Test': test_used,
+            'P_value': round(p_value, 4) if not np.isnan(p_value) else "N/A",
+            'Significant': f"{significant} {significance_stars}".strip(),
+            'Categories_Summary': categories_str,
+        }
+
+        # Add counts for each group
+        for group_val in sorted(df[target_col].unique()):
+            result_row[f'N_{group_val}'] = counts_data[f'N_{group_val}']
+            result_row[f'Mean_{group_val}'] = "N/A"  # Not applicable for qualitative
+
+        results.append(result_row)
+
+    stats_df = pd.DataFrame(results)
+
+    # Sort by P-value
+    if 'P_value' in stats_df.columns:
+        # Separate rows with numeric P-values
+        numeric_p = stats_df[stats_df['P_value'] != "N/A"].copy()
+        non_numeric_p = stats_df[stats_df['P_value'] == "N/A"].copy()
+
+        if not numeric_p.empty:
+            # Convert P_value to numeric
+            numeric_p['P_value_num'] = pd.to_numeric(numeric_p['P_value'])
+            numeric_p = numeric_p.sort_values('P_value_num')
+            numeric_p = numeric_p.drop(columns=['P_value_num'])
+
+            # Recombine
+            stats_df = pd.concat([numeric_p, non_numeric_p])
+
+    print(f"Statistical table created: {len(results)} variables")
+
+    return stats_df
+
+
+# =============================================================================
+#  6. Frequency Table for Qualitative Variables
+# =============================================================================
+
+def create_frequency_table(df):
+    """Create frequency table for qualitative variables"""
+
+    print("\n" + "=" * 60)
+    print("Frequency Table for Qualitative Variables")
+    print("=" * 60)
+
+    target_col = 'Surfactant_Administered'
+
+    # Qualitative variables based on your definition
+    qualitative_cols = [
+        'Delivery_Mode', 'Maternal_Diabetes', 'Maternal_Education',
+        'Maternal_Occupation', 'Treatment_Type', 'Maternal_Blood_Pressure',
+        'Substance_Use_Pregnancy', 'PROM', 'Chorioamnionitis',
+        'History_Premature_Birth', 'Antenatal_Steroid', 'Amniotic_Fluid',
+        'Fetal_Growth', 'Fetal_Distress', 'IVF', 'Multiple_Birth', 'Infant_Gender',
+        'Breathing_Condition_Birth', 'Respiratory_Distress', 'Resuscitation_Needed',
+        'Oxygen_Therapy', 'CPAP_Needed', 'PPV_Needed', 'Intubation_Needed',
+        'Cardiac_Massage_Needed', 'Medication_Given'
+    ]
+
+    qualitative_cols = [col for col in qualitative_cols if col in df.columns]
+
+    results = []
+
+    for col in qualitative_cols:
+        # Create cross-tabulation
+        cross_tab = pd.crosstab(df[col], df[target_col])
+
+        # Ensure all groups are present
+        unique_groups = sorted(df[target_col].unique())
+        for group_val in unique_groups:
+            if group_val not in cross_tab.columns:
+                cross_tab[group_val] = 0
+
+        # Order columns
+        cross_tab = cross_tab[unique_groups]
+
+        # Calculate percentages
+        cross_tab_percent = cross_tab.div(cross_tab.sum(axis=1), axis=0) * 100
+
+        # For each category
+        for category in cross_tab.index:
+            row = {
+                'Variable': col,
+                'Category': str(category),
+            }
+
+            # Add counts and percentages for each group
+            for group_val in unique_groups:
+                row[f'Count_{group_val}'] = int(cross_tab.loc[category, group_val])
+                row[f'Percent_{group_val}'] = round(cross_tab_percent.loc[category, group_val], 1)
+
+            # Calculate totals
+            total_count = int(cross_tab.loc[category].sum())
+            row['Total_Count'] = total_count
+            row['Total_Percent'] = round((total_count / cross_tab.sum().sum()) * 100, 1)
+
+            results.append(row)
+
+    freq_df = pd.DataFrame(results)
+
+    print(f" Frequency table created: {len(qualitative_cols)} qualitative variables")
+
+    return freq_df
+
+
+# =============================================================================
+#  7. Create Visualizations
+# =============================================================================
+
+def create_visualizations(df, total_patients):
+    """Create analysis visualizations"""
+
+    print("\n" + "=" * 60)
+    print(" Creating Analysis Visualizations")
+    print("=" * 60)
+
+    try:
+        os.makedirs('Analysis_Results', exist_ok=True)
+    except:
+        pass
+
+    target_col = 'Surfactant_Administered'
+
+    # 1. Distribution of surfactant groups
+    plt.figure(figsize=(12, 8))
+
+    # Get counts
+    target_counts = df[target_col].value_counts().sort_index()
+    labels = []
+    counts = []
+
+    for val in sorted(df[target_col].unique()):
+        count = target_counts.get(val, 0)
+        percentage = (count / total_patients) * 100
+
+        if val == 0:
+            label = f"No Surfactant\n{count} ({percentage:.1f}%)"
+        elif val == 1:
+            label = f"1 Administration\n{count} ({percentage:.1f}%)"
+        elif val == 2:
+            label = f"2 Administrations\n{count} ({percentage:.1f}%)"
+        else:
+            label = f"{val} Administrations\n{count} ({percentage:.1f}%)"
+
+        labels.append(label)
+        counts.append(count)
+
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1']
+
+    # Create pie chart with exact values
+    plt.pie(counts, labels=labels, autopct='%1.1f%%',
+            colors=colors[:len(counts)], startangle=90, explode=[0.05] * len(counts),
+            textprops={'fontsize': 10})
+    plt.title(f'Distribution of Patients by Surfactant Administration\nTotal Patients: {total_patients}',
+              fontsize=14, fontweight='bold')
+
+    plt.savefig('Analysis_Results/Surfactant_Distribution.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # 2. Box plots for important quantitative variables
+    important_vars = ['Gestational_Age_Weeks', 'Birth_Weight', 'Maternal_Age']
+    important_vars = [var for var in important_vars if var in df.columns]
+
+    for var in important_vars:
+        plt.figure(figsize=(12, 6))
+
+        # Prepare data for box plot
+        data_to_plot = []
+        group_labels = []
+
+        for group_val in sorted(df[target_col].unique()):
+            group_data = df[df[target_col] == group_val][var].dropna()
+            if len(group_data) > 0:
+                data_to_plot.append(group_data)
+
+                if group_val == 0:
+                    label = f"No Surfactant\n(n={len(group_data)})"
+                elif group_val == 1:
+                    label = f"1 Administration\n(n={len(group_data)})"
+                elif group_val == 2:
+                    label = f"2 Administrations\n(n={len(group_data)})"
+                else:
+                    label = f"Group {group_val}\n(n={len(group_data)})"
+
+                group_labels.append(label)
+
+        plt.boxplot(data_to_plot, labels=group_labels,
+                    patch_artist=True, boxprops=dict(facecolor='lightblue'),
+                    medianprops=dict(color='red'))
+
+        # Set titles based on variable
+        if var == 'Gestational_Age_Weeks':
+            title = 'Gestational Age (Weeks)'
+            ylabel = 'Weeks'
+        elif var == 'Birth_Weight':
+            title = 'Birth Weight'
+            ylabel = 'Grams'
+        elif var == 'Maternal_Age':
+            title = 'Maternal Age'
+            ylabel = 'Years'
+        else:
+            title = var
+            ylabel = var
+
+        plt.title(f'Comparison of {title} by Surfactant Group', fontsize=12, fontweight='bold')
+        plt.ylabel(ylabel)
+        plt.xlabel('Surfactant Administration Group')
+        plt.grid(True, alpha=0.3)
+
+        # Save plot
+        plt.tight_layout()
+        plt.savefig(f'Analysis_Results/{var}_Comparison.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+    print(" Visualizations created and saved")
+
+
+# =============================================================================
+#  8. Save All Results
+# =============================================================================
+
+def save_all_results(target_summary, descriptive_table, stats_table, frequency_table, outlier_summary):
+    """Save all results to Excel file"""
+
+    print("\n" + "=" * 60)
+    print(" Saving All Results to Excel File")
+    print("=" * 60)
+
+    try:
+        with pd.ExcelWriter('Complete_Analysis_Results.xlsx') as writer:
+            # Target summary
+            if target_summary is not None:
+                target_summary.to_excel(writer, sheet_name='Target_Summary', index=False)
+                print("  ✓ Target summary saved")
+
+            # Descriptive statistics
+            if descriptive_table is not None:
+                descriptive_table.to_excel(writer, sheet_name='Descriptive_Stats', index=False)
+                print("  ✓ Descriptive statistics saved")
+
+            # Statistical analysis
+            if stats_table is not None:
+                stats_table.to_excel(writer, sheet_name='Statistical_Analysis', index=False)
+                print("  ✓ Statistical analysis saved")
+
+            # Frequency table
+            if frequency_table is not None:
+                frequency_table.to_excel(writer, sheet_name='Frequency_Table', index=False)
+                print("  ✓ Frequency table saved")
+
+            # Outlier summary
+            if outlier_summary is not None:
+                outlier_df = pd.DataFrame(outlier_summary)
+                outlier_df.to_excel(writer, sheet_name='Outlier_Summary', index=False)
+                print("  ✓ Outlier summary saved")
+
+            # Explanation sheet
+            explanation = pd.DataFrame({
+                'Sheet': ['Target_Summary', 'Descriptive_Stats', 'Statistical_Analysis', 'Frequency_Table',
+                          'Outlier_Summary'],
+                'Description': [
+                    'Distribution of patients in surfactant groups',
+                    'Mean, SD, min, max of quantitative variables',
+                    'Statistical test results (P-values) for all variables',
+                    'Frequency distribution of qualitative variables',
+                    'Summary of detected outliers (not removed)'
+                ]
+            })
+            explanation.to_excel(writer, sheet_name='Sheet_Descriptions', index=False)
+            print("  ✓ Sheet descriptions saved")
+
+        print("\n All results saved to 'Complete_Analysis_Results.xlsx'")
+
+    except Exception as e:
+        print(f" Error saving file: {e}")
+
+
+# =============================================================================
+# 🎯 Main Function
+# =============================================================================
+
+def main():
+    """Main analysis function"""
+
+    print("=" * 70)
+    print(" RDS Data Analysis - Surfactant Administration Prediction")
+    print("=" * 70)
+
+    # File path
+    input_file = "RDS_encoded_data.xlsx"  # Change this to your file name
+
+    # 1. Read data
+    df = read_data(input_file)
+    if df is None:
+        return
+
+    print(f"\n Initial data shape: {df.shape}")
+    print(f" Total patients: {len(df)}")
+
+    # 2. Identify outliers (but DO NOT remove)
+    df_clean, outlier_summary = identify_outliers(df)
+    print(f" Data shape after analysis: {df_clean.shape}")
+    print(" All rows preserved")
+
+    # 3. Analyze target column
+    target_summary, total_patients = analyze_target_column(df_clean)
+
+    # Verify counts based on your numbers
+    print(f"\n Verifying your reported numbers:")
+    print(f"  302 patients without surfactant ({302 / 600 * 100:.1f}% of 600)")
+    print(f"  222 patients with 1 administration ({222 / 600 * 100:.1f}% of 600)")
+    print(f"  76 patients with 2 administrations ({76 / 600 * 100:.1f}% of 600)")
+    print(f"  Total: {302 + 222 + 76} patients")
+
+    # 4. Descriptive statistics table (only quantitative)
+    descriptive_table = create_descriptive_table(df_clean)
+
+    # 5. Statistical analysis table (both quantitative and qualitative)
+    stats_table = create_statistical_table(df_clean)
+
+    # 6. Frequency table (only qualitative)
+    frequency_table = create_frequency_table(df_clean)
+
+    # 7. Create visualizations
+    create_visualizations(df_clean, total_patients)
+
+    # 8. Save all results
+    save_all_results(target_summary, descriptive_table, stats_table, frequency_table, outlier_summary)
+
+    # Display key results
+    print("\n" + "=" * 70)
+    print(" Key Findings Summary:")
+    print("=" * 70)
+
+    # Show target distribution
+    if target_summary is not None:
+        print("\n Target Variable Distribution:")
+        print(target_summary.to_string(index=False))
+
+    # Show significant findings
+    if stats_table is not None:
+        print("\n Variables with Significant Differences (P < 0.05):")
+
+        # Find rows with significant P-values
+        significant_rows = []
+        for _, row in stats_table.iterrows():
+            p_val = row['P_value']
+            if p_val != "N/A" and isinstance(p_val, (int, float)):
+                if p_val < 0.05:
+                    significant_rows.append(row)
+
+        if significant_rows:
+            print(f"\nFound {len(significant_rows)} variables with significant differences:")
+            for row in significant_rows[:15]:  # Show first 15
+                var = row['Variable']
+                p_val = row['P_value']
+                sig = row['Significant']
+                var_type = row['Type']
+                test_used = row['Test']
+
+                # Determine significance level
+                if "***" in sig:
+                    sig_level = "p < 0.001"
+                elif "**" in sig:
+                    sig_level = "p < 0.01"
+                elif "*" in sig:
+                    sig_level = "p < 0.05"
+                else:
+                    sig_level = ""
+
+                print(f"  • {var:<30} ({var_type}): p = {p_val:.4f} {sig_level} [{test_used}]")
+        else:
+            print("  No variables with significant differences found")
+
+    print(f"\n Analysis Complete!")
+    print(f" Output Files:")
+    print(f"  • Complete_Analysis_Results.xlsx - All analysis tables")
+    print(f"  • Analysis_Results/ folder - All visualizations")
+    print(f"\n Total patients analyzed: {total_patients}")
+    print(f" All rows preserved - no data removed")
+
+
+# =============================================================================
+#  Run Program
+# =============================================================================
+
+if __name__ == "__main__":
+    # Check if file exists
+    input_file = "./RDS_encoded_data.xlsx"
+
+    if not os.path.exists(input_file):
+        print(f" File '{input_file}' not found!")
+        print(" Please make sure your file is in the current directory:")
+        print(f"  {os.path.abspath('.')}")
+
+        # List available Excel files
+        print("\n Available Excel files in current directory:")
+        excel_files = [f for f in os.listdir('.') if f.endswith(('.xlsx', '.xls'))]
+
+        if excel_files:
+            for f in excel_files:
+                print(f"  - {f}")
+
+            # Ask user to select a file
+            try:
+                selection = input("\nEnter the file name to use: ").strip()
+                if selection in excel_files:
+                    print(f" Using file: {selection}")
+                    # Modify the input_file variable in the code
+                    import re
+
+                    with open(__file__, 'r', encoding='utf-8') as file:
+                        content = file.read()
+
+                    # Replace the input file name
+                    new_content = re.sub(r'input_file = ".*?"', f'input_file = "{selection}"', content)
+
+                    with open(__file__, 'w', encoding='utf-8') as file:
+                        file.write(new_content)
+
+                    print(f"✅ File name updated in code. Please run the program again.")
+                else:
+                    print(" Invalid selection. Please run the program again after placing your file.")
+            except:
+                print(" Error reading input. Please rename your file to 'RDS_encoded_data.xlsx'")
+        else:
+            print("  No Excel files found in current directory.")
+    else:
+        main()
