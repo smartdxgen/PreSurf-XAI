@@ -1,0 +1,29 @@
+
+## Input Data Requirements
+
+The script expects an Excel file with columns matching these naming conventions:
+
+**Quantitative Variables:**
+- `Gestational_Age_Weeks`, `Gestational_Age_Days`, `Gestational_Age_Days_total`
+- `Maternal_Age`
+- `Birth_Weight`, `Birth_Height`, `Head_Circumference`
+- `Umbilical_pH`, `Base_Excess`, `FiO2`
+
+**Categorical Variables:**
+- `Delivery_Mode`, `Maternal_Diabetes`, `Maternal_Education`, `Maternal_Occupation`
+- `Treatment_Type`, `Maternal_Blood_Pressure`, `Substance_Use_Pregnancy`
+- `PROM`, `Chorioamnionitis`, `History_Premature_Birth`, `Antenatal_Steroid`
+- `Amniotic_Fluid`, `Fetal_Growth`, `Fetal_Distress`, `IVF`, `Multiple_Birth`
+- `Infant_Gender`, `Breathing_Condition_Birth`, `Respiratory_Distress`
+- `Resuscitation_Needed`, `Oxygen_Therapy`, `CPAP_Needed`, `PPV_Needed`
+- `Intubation_Needed`, `Cardiac_Massage_Needed`, `Medication_Given`
+
+**Target Variable:**
+- `Surfactant_Administered` (0 = no surfactant, 1 = one dose, 2 = two doses)
+
+## Usage
+
+### 1. Install Dependencies
+
+```bash
+pip install pandas numpy matplotlib seaborn scipy openpyxl
