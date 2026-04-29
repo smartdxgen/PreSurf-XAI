@@ -1,6 +1,32 @@
-# PreSurf-XAI
-An Explainable Machine Learning Framework for Predicting Surfactant Need and Dosage in Preterm Infants with Respiratory Distress Syndrome
-Background: Respiratory distress syndrome (RDS) is a major cause of morbidity and mortality in premature infants and often necessitates exogenous surfactant therapy. In neonatal intensive care units (NICUs), the timely identification of infants requiring surfactant and the determination of the optimal number of doses remain challenging, as current decision-making relies on heterogeneous clinical, imaging, and laboratory data that may delay or misguide treatment.
-Objective: To develop and evaluate an explainable machine learning (ML) framework for early prediction of surfactant therapy requirement and estimation of the optimal number of doses in preterm neonates.
-Methods: This retrospective–prospective cohort study included 600 preterm neonates (≤34 weeks’ gestation) admitted to NICUs affiliated with Mashhad University of Medical Sciences, between 2023 and 2025. Among them, 300 neonates with RDS who received surfactant were compared with 300 neonates without RDS. Clinical, maternal, and perinatal data were extracted using a structured checklist. A two-stage explainable ML framework (PreSurf-XAI) was implemented: (1) a CatBoost binary classifier to predict surfactant requirement, and (2) a Random Forest multiclass classifier with SMOTE to predict the number of doses. Model interpretability was assessed using feature importance and SHAP analyses.
-Conclusions: The PreSurf-XAI framework shows strong potential for predicting both the need for surfactant therapy and the number of required doses in preterm infants with suspected RDS. Its integration of predictive accuracy with explainability may enhance early clinical decision-making, reduce unnecessary surfactant administration, and support personalized treatment strategies in NICU settings.
+## Overview
+Respiratory distress syndrome (RDS) remains a leading cause of morbidity and mortality in premature infants, often requiring timely exogenous surfactant therapy. Current clinical decision-making for surfactant administration and dosing is challenging due to the integration of heterogeneous clinical, imaging, and laboratory data.
+
+PreSurf-XAI is an explainable machine learning framework designed to support early, personalized decisions regarding surfactant therapy in preterm neonates (≤34 weeks' gestation). The framework addresses two sequential clinical questions:
+
+Will the infant require surfactant therapy? (binary prediction)
+
+How many surfactant doses will be needed? (multiclass prediction: 0, 1, or 2 doses)
+
+## Key Features: 
+Two-stage explainable architecture combining CatBoost (binary) and Random Forest with SMOTE (multiclass)
+
+High predictive performance with built-in interpretability via SHAP analysis and feature importance
+
+Clinically actionable outputs designed for NICU decision support
+
+Handles class imbalance using synthetic oversampling techniques
+
+## Key Predictive Features
+Surfactant Requirement Prediction
+FiO₂ at admission
+Gestational age
+Head circumference
+Respiratory distress at birth
+Base excess
+
+## Dose Number Prediction
+FiO₂ at admission
+5-minute Apgar score
+Base excess
+Gravidity
+Multiple birth (twin/triplet)
